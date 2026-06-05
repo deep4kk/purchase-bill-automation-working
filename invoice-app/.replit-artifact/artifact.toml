@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Invoice Processing & GST Reconciliation"
+version = "1.0.0"
+id = "artifacts/invoice-app"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25804
+
+[services.development]
+run = "pnpm --filter @workspace/invoice-app run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/invoice-app", "run", "build" ]
+publicDir = "artifacts/invoice-app/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25804"
+BASE_PATH = "/"
