@@ -1,6 +1,6 @@
-import { db, auditLogsTable } from "@workspace/db";
 import type { Request } from "express";
 import { logger } from "./logger";
+import { createAuditLog } from "./dal";
 
 export async function logAudit(
   req: Request,
@@ -11,14 +11,14 @@ export async function logAudit(
 ): Promise<void> {
   if (!req.user) return;
   try {
-    await db.insert(auditLogsTable).values({
+    await createAuditLog({
       userId: req.user.userId,
       userName: req.user.name,
       action,
       resourceType,
-      resourceId: resourceId ?? null,
-      details: details ?? null,
-      ipAddress: req.ip ?? null,
+      resourceId: resourceId ?? undefined,
+      details: details ?? undefined,
+      ipAddress: req.ip ?? undefined,
     });
   } catch (err) {
     logger.error({ err }, "Failed to write audit log");

@@ -128,8 +128,8 @@ export async function extractInvoiceWithAI(filePath: string, fileType: string): 
 export async function matchSupplierWithAI(
   supplierName: string | null,
   supplierGstin: string | null,
-  erpSuppliers: Array<{ id: number; name: string; gstin: string | null }>,
-): Promise<{ matchedId: number | null; confidence: number }> {
+  erpSuppliers: Array<{ id: string; name: string; gstin: string | null }>,
+): Promise<{ matchedId: string | null; confidence: number }> {
   if (!supplierGstin && !supplierName) return { matchedId: null, confidence: 0 };
 
   if (supplierGstin) {
@@ -139,7 +139,7 @@ export async function matchSupplierWithAI(
 
   if (supplierName) {
     const normalizedInput = supplierName.toLowerCase().replace(/[^a-z0-9]/g, "");
-    let bestMatch: { id: number; score: number } | null = null;
+    let bestMatch: { id: string; score: number } | null = null;
     for (const s of erpSuppliers) {
       const normalizedName = s.name.toLowerCase().replace(/[^a-z0-9]/g, "");
       if (normalizedName.includes(normalizedInput) || normalizedInput.includes(normalizedName)) {

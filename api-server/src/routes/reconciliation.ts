@@ -1,15 +1,22 @@
 import { Router } from "express";
-import { db, reconciliationRecordsTable, gstr2bRecordsTable, invoicesTable } from "@workspace/db";
-import { eq, and, sql } from "drizzle-orm";
 import { authenticate } from "../lib/auth";
 import { logAudit } from "../lib/audit";
 import { ListReconciliationRecordsQueryParams, RunReconciliationBody } from "@workspace/api-zod";
+import {
+  findReconciliationRecords,
+  deleteReconciliationByPeriod,
+  findReconciliationByPeriod,
+  createReconciliationRecords,
+  findGstr2bByPeriod,
+  findInvoices,
+} from "../lib/dal";
+import { ReconciliationRecord, Invoice, Gstr2bRecord } from "../lib/schemas";
 
 const router = Router();
 
-function formatRecord(r: typeof reconciliationRecordsTable.$inferSelect) {
+function formatRecord(r: ReconciliationRecord & { _id: { toHexString: () => string } }) {
   return {
-    id: String(r.id),
+    id: r._id.toHexString(),
     period: r.period,
     status: r.status,
     supplierGstin: r.supplierGstin,
@@ -26,6 +33,7 @@ function formatRecord(r: typeof reconciliationRecordsTable.$inferSelect) {
     gstr2bIgst: r.gstr2bIgst !== null ? Number(r.gstr2bIgst) : null,
     mismatchAmount: r.mismatchAmount !== null ? Number(r.mismatchAmount) : null,
     createdAt: r.createdAt.toISOString(),
+    updatedAt: r.updatedAt.toISOString(),
   };
 }
 
@@ -33,16 +41,17 @@ router.get("/reconciliation", authenticate, async (req, res): Promise<void> => {
   const params = ListReconciliationRecordsQueryParams.safeParse(req.query);
   const page = params.success ? (params.data.page ?? 1) : 1;
   const limit = params.success ? (params.data.limit ?? 20) : 20;
-  const offset = (page - 1) * limit;
-  const conditions = [];
+  const sortBy = params.success ? params.data.sortBy : undefined;
+  const sortOrder = params.success ? params.data.sortOrder : undefined;
+
+  const filter: Record<string, unknown> = {};
   if (params.success) {
-    if (params.data.period) conditions.push(eq(reconciliationRecordsTable.period, params.data.period));
-    if (params.data.status) conditions.push(eq(reconciliationRecordsTable.status, params.data.status));
+    if (params.data.period) filter.period = params.data.period;
+    if (params.data.status) filter.status = params.data.status;
   }
-  const where = conditions.length > 0 ? and(...conditions) : undefined;
-  const rows = await db.select().from(reconciliationRecordsTable).where(where).limit(limit).offset(offset);
-  const [{ count }] = await db.select({ count: sql<number>`count(*)` }).from(reconciliationRecordsTable).where(where);
-  res.json({ data: rows.map(formatRecord), total: Number(count), page, limit });
+
+  const result = await findReconciliationRecords(filter, { page, limit, sortBy, sortOrder });
+  res.json({ data: result.data.map(formatRecord), total: result.total, page, limit, sortBy: result.sortBy, sortOrder: result.sortOrder });
 });
 
 router.post("/reconciliation/run", authenticate, async (req, res): Promise<void> => {
@@ -50,24 +59,20 @@ router.post("/reconciliation/run", authenticate, async (req, res): Promise<void>
   if (!parsed.success) { res.status(400).json({ error: parsed.error.message }); return; }
   const { period } = parsed.data;
 
-  await db.delete(reconciliationRecordsTable).where(eq(reconciliationRecordsTable.period, period));
+  await deleteReconciliationByPeriod(period);
 
-  const gstr2bRows = await db.select().from(gstr2bRecordsTable).where(eq(gstr2bRecordsTable.period, period));
-  const erpInvoices = await db.select().from(invoicesTable).where(and(eq(invoicesTable.status, "pushed")));
+  const gstr2bRows = await findGstr2bByPeriod(period);
+  const erpInvoicesResult = await findInvoices({ status: "pushed" }, { limit: 10000 });
+  const erpInvoices = erpInvoicesResult.data;
 
-  const erpMap = new Map<string, typeof invoicesTable.$inferSelect>();
+  const erpMap = new Map<string, Invoice>();
   for (const inv of erpInvoices) {
     if (inv.supplierGstin && inv.invoiceNumber) {
       erpMap.set(`${inv.supplierGstin}__${inv.invoiceNumber}`, inv);
     }
   }
 
-  const gstrMap = new Map<string, typeof gstr2bRecordsTable.$inferSelect>();
-  for (const g of gstr2bRows) {
-    gstrMap.set(`${g.supplierGstin}__${g.invoiceNumber}`, g);
-  }
-
-  const insertRecords: Array<typeof reconciliationRecordsTable.$inferInsert> = [];
+  const insertRecords: Array<Omit<ReconciliationRecord, "_id" | "createdAt" | "updatedAt">> = [];
   const processedKeys = new Set<string>();
 
   for (const g of gstr2bRows) {
@@ -87,11 +92,11 @@ router.post("/reconciliation/run", authenticate, async (req, res): Promise<void>
         gstr2bCgst: g.cgst,
         gstr2bSgst: g.sgst,
         gstr2bIgst: g.igst,
-        erpTaxableValue: null,
-        erpCgst: null,
-        erpSgst: null,
-        erpIgst: null,
-        mismatchAmount: null,
+        erpTaxableValue: undefined,
+        erpCgst: undefined,
+        erpSgst: undefined,
+        erpIgst: undefined,
+        mismatchAmount: undefined,
       });
       continue;
     }
@@ -103,7 +108,7 @@ router.post("/reconciliation/run", authenticate, async (req, res): Promise<void>
     const taxableDiff = Math.abs(erpTaxable - gstrTaxable);
     const gstDiff = Math.abs(erpGst - gstrGst);
 
-    let status = "matched";
+    let status: ReconciliationRecord["status"] = "matched";
     if (taxableDiff > 1) status = "amount_mismatch";
     else if (gstDiff > 1) status = "gst_mismatch";
 
@@ -122,7 +127,7 @@ router.post("/reconciliation/run", authenticate, async (req, res): Promise<void>
       erpCgst: erp.cgst,
       erpSgst: erp.sgst,
       erpIgst: erp.igst,
-      mismatchAmount: status === "matched" ? null : Math.max(taxableDiff, gstDiff).toFixed(2),
+      mismatchAmount: status === "matched" ? undefined : Math.max(taxableDiff, gstDiff).toFixed(2),
     });
   }
 
@@ -141,16 +146,16 @@ router.post("/reconciliation/run", authenticate, async (req, res): Promise<void>
       erpCgst: erp.cgst,
       erpSgst: erp.sgst,
       erpIgst: erp.igst,
-      gstr2bTaxableValue: null,
-      gstr2bCgst: null,
-      gstr2bSgst: null,
-      gstr2bIgst: null,
-      mismatchAmount: null,
+      gstr2bTaxableValue: undefined,
+      gstr2bCgst: undefined,
+      gstr2bSgst: undefined,
+      gstr2bIgst: undefined,
+      mismatchAmount: undefined,
     });
   }
 
   if (insertRecords.length > 0) {
-    await db.insert(reconciliationRecordsTable).values(insertRecords as typeof reconciliationRecordsTable.$inferInsert[]);
+    await createReconciliationRecords(insertRecords);
   }
 
   const total = insertRecords.length;
@@ -174,9 +179,10 @@ router.post("/reconciliation/run", authenticate, async (req, res): Promise<void>
 
 router.get("/reconciliation/summary", authenticate, async (req, res): Promise<void> => {
   const period = req.query.period as string | undefined;
-  const conditions = period ? [eq(reconciliationRecordsTable.period, period)] : [];
-  const where = conditions.length > 0 ? and(...conditions) : undefined;
-  const rows = await db.select().from(reconciliationRecordsTable).where(where);
+  const filter: Record<string, unknown> = {};
+  if (period) filter.period = period;
+
+  const rows = await findReconciliationByPeriod(period ?? "");
   const total = rows.length;
   const matched = rows.filter((r) => r.status === "matched").length;
   res.json({

@@ -1,18 +1,20 @@
 import { Router } from "express";
-import { db, erpConnectionsTable, suppliersTable, itemsTable } from "@workspace/db";
 import { authenticate, requireRole } from "../lib/auth";
 import { UpdateErpSettingsBody } from "@workspace/api-zod";
+import {
+  getErpConnection as dalGetErpConnection,
+  createOrUpdateErpConnection,
+  updateErpConnection,
+  upsertSupplierByErpId,
+  upsertItemByErpId,
+} from "../lib/dal";
+import { ErpConnection } from "../lib/schemas";
 
 const router = Router();
 
-async function getErpConnection() {
-  const [conn] = await db.select().from(erpConnectionsTable).limit(1);
-  return conn;
-}
-
-function formatSettings(c: typeof erpConnectionsTable.$inferSelect) {
+function formatSettings(c: ErpConnection & { _id: { toHexString: () => string } }) {
   return {
-    id: String(c.id),
+    id: c._id.toHexString(),
     erpUrl: c.erpUrl,
     apiKey: c.apiKey,
     isConnected: c.isConnected,
@@ -21,7 +23,7 @@ function formatSettings(c: typeof erpConnectionsTable.$inferSelect) {
 }
 
 router.get("/erp/settings", authenticate, async (_req, res): Promise<void> => {
-  const conn = await getErpConnection();
+  const conn = await dalGetErpConnection();
   if (!conn) {
     res.json({ id: "0", erpUrl: "", apiKey: "", isConnected: false, lastSyncedAt: null });
     return;
@@ -36,18 +38,12 @@ router.put("/erp/settings", authenticate, requireRole("admin"), async (req, res)
     return;
   }
   const { erpUrl, apiKey, apiSecret } = parsed.data;
-  const existing = await getErpConnection();
-  let conn;
-  if (existing) {
-    [conn] = await db.update(erpConnectionsTable).set({ erpUrl, apiKey, apiSecret }).where((t) => t.id.equals(existing.id)).returning();
-  } else {
-    [conn] = await db.insert(erpConnectionsTable).values({ erpUrl, apiKey, apiSecret, isConnected: false }).returning();
-  }
+  const conn = await createOrUpdateErpConnection({ erpUrl, apiKey, apiSecret });
   res.json(formatSettings(conn));
 });
 
 router.post("/erp/test-connection", authenticate, async (_req, res): Promise<void> => {
-  const conn = await getErpConnection();
+  const conn = await dalGetErpConnection();
   if (!conn) {
     res.json({ success: false, message: "ERP settings not configured", version: null });
     return;
@@ -59,7 +55,7 @@ router.post("/erp/test-connection", authenticate, async (_req, res): Promise<voi
     });
     if (response.ok) {
       const data = await response.json() as { message?: string };
-      await db.update(erpConnectionsTable).set({ isConnected: true }).where((t) => t.id.equals(conn.id));
+      await updateErpConnection({ isConnected: true });
       res.json({ success: true, message: "Connection successful", version: data.message ?? null });
     } else {
       res.json({ success: false, message: `Connection failed: HTTP ${response.status}`, version: null });
@@ -71,7 +67,7 @@ router.post("/erp/test-connection", authenticate, async (_req, res): Promise<voi
 });
 
 router.post("/erp/sync/suppliers", authenticate, requireRole("admin", "accounts"), async (req, res): Promise<void> => {
-  const conn = await getErpConnection();
+  const conn = await dalGetErpConnection();
   if (!conn?.isConnected) {
     res.json({ success: false, synced: 0, message: "ERP not connected" });
     return;
@@ -88,15 +84,14 @@ router.post("/erp/sync/suppliers", authenticate, requireRole("admin", "accounts"
     const data = await response.json() as { data: Array<{ name: string; supplier_name: string; gstin?: string }> };
     let synced = 0;
     for (const s of data.data ?? []) {
-      await db.insert(suppliersTable).values({
+      await upsertSupplierByErpId(s.name, {
         name: s.supplier_name || s.name,
-        gstin: s.gstin ?? null,
-        erpSupplierId: s.name,
+        gstin: s.gstin ?? undefined,
         isMatched: true,
-      }).onConflictDoUpdate({ target: suppliersTable.erpSupplierId, set: { name: s.supplier_name || s.name, gstin: s.gstin ?? null, isMatched: true } }).catch(() => null);
+      });
       synced++;
     }
-    await db.update(erpConnectionsTable).set({ lastSyncedAt: new Date() }).where((t) => t.id.equals(conn.id));
+    await updateErpConnection({ lastSyncedAt: new Date() });
     res.json({ success: true, synced, message: `Synced ${synced} suppliers` });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Unknown error";
@@ -105,7 +100,7 @@ router.post("/erp/sync/suppliers", authenticate, requireRole("admin", "accounts"
 });
 
 router.post("/erp/sync/items", authenticate, requireRole("admin", "accounts"), async (req, res): Promise<void> => {
-  const conn = await getErpConnection();
+  const conn = await dalGetErpConnection();
   if (!conn?.isConnected) {
     res.json({ success: false, synced: 0, message: "ERP not connected" });
     return;
@@ -122,13 +117,12 @@ router.post("/erp/sync/items", authenticate, requireRole("admin", "accounts"), a
     const data = await response.json() as { data: Array<{ name: string; item_name: string; item_code?: string; gst_hsn_code?: string; stock_uom?: string }> };
     let synced = 0;
     for (const item of data.data ?? []) {
-      await db.insert(itemsTable).values({
+      await upsertItemByErpId(item.name, {
         name: item.item_name || item.name,
-        itemCode: item.item_code ?? null,
-        erpItemCode: item.name,
-        hsn: item.gst_hsn_code ?? null,
-        uom: item.stock_uom ?? null,
-      }).onConflictDoNothing().catch(() => null);
+        itemCode: item.item_code ?? undefined,
+        hsn: item.gst_hsn_code ?? undefined,
+        uom: item.stock_uom ?? undefined,
+      });
       synced++;
     }
     res.json({ success: true, synced, message: `Synced ${synced} items` });

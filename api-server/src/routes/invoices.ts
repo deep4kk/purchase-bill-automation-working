@@ -2,8 +2,6 @@ import { Router } from "express";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
-import { db, invoicesTable, suppliersTable } from "@workspace/db";
-import { eq, ilike, and, sql, gte, lte } from "drizzle-orm";
 import { authenticate, requireRole } from "../lib/auth";
 import { logAudit } from "../lib/audit";
 import { extractInvoiceWithAI, matchSupplierWithAI } from "../lib/ai";
@@ -20,7 +18,17 @@ import {
   PushInvoiceToErpParams,
   ApproveInvoiceParams,
 } from "@workspace/api-zod";
-import { erpConnectionsTable } from "@workspace/db";
+import {
+  findInvoices,
+  findInvoiceById,
+  createInvoice,
+  updateInvoice,
+  deleteInvoice,
+  findSuppliers,
+  getErpConnection,
+  toStringId,
+} from "../lib/dal";
+import { Invoice, InvoiceItem } from "../lib/schemas";
 
 ensureUploadDir();
 
@@ -42,33 +50,34 @@ const upload = multer({
 
 const router = Router();
 
-function formatInvoice(inv: typeof invoicesTable.$inferSelect) {
+function formatInvoice(inv: Invoice & { _id: { toHexString: () => string }; createdAt: Date; updatedAt: Date }) {
   return {
-    id: String(inv.id),
+    id: inv._id.toHexString(),
     fileName: inv.fileName,
     fileUrl: inv.fileUrl,
     fileType: inv.fileType,
     status: inv.status,
     supplierName: inv.supplierName ?? null,
     supplierGstin: inv.supplierGstin ?? null,
-    matchedSupplierId: inv.matchedSupplierId ? String(inv.matchedSupplierId) : null,
+    matchedSupplierId: inv.matchedSupplierId ?? null,
     matchedSupplierName: inv.matchedSupplierName ?? null,
     supplierMatchStatus: inv.supplierMatchStatus,
     invoiceNumber: inv.invoiceNumber ?? null,
     invoiceDate: inv.invoiceDate ?? null,
     placeOfSupply: inv.placeOfSupply ?? null,
-    taxableValue: inv.taxableValue !== null ? Number(inv.taxableValue) : null,
-    cgst: inv.cgst !== null ? Number(inv.cgst) : null,
-    sgst: inv.sgst !== null ? Number(inv.sgst) : null,
-    igst: inv.igst !== null ? Number(inv.igst) : null,
-    grandTotal: inv.grandTotal !== null ? Number(inv.grandTotal) : null,
+    taxableValue: inv.taxableValue != null ? Number(inv.taxableValue) : null,
+    cgst: inv.cgst != null ? Number(inv.cgst) : null,
+    sgst: inv.sgst != null ? Number(inv.sgst) : null,
+    igst: inv.igst != null ? Number(inv.igst) : null,
+    grandTotal: inv.grandTotal != null ? Number(inv.grandTotal) : null,
     items: Array.isArray(inv.items) ? inv.items : [],
-    confidenceScore: inv.confidenceScore !== null ? Number(inv.confidenceScore) : null,
+    confidenceScore: inv.confidenceScore != null ? Number(inv.confidenceScore) : null,
     erpDocumentId: inv.erpDocumentId ?? null,
     erpStatus: inv.erpStatus ?? null,
     erpError: inv.erpError ?? null,
     extractedAt: inv.extractedAt?.toISOString() ?? null,
     createdAt: inv.createdAt.toISOString(),
+    updatedAt: inv.updatedAt.toISOString(),
   };
 }
 
@@ -76,33 +85,35 @@ router.get("/invoices", authenticate, async (req, res): Promise<void> => {
   const params = ListInvoicesQueryParams.safeParse(req.query);
   const page = params.success ? (params.data.page ?? 1) : 1;
   const limit = params.success ? (params.data.limit ?? 20) : 20;
-  const offset = (page - 1) * limit;
-  const conditions = [];
+  const sortBy = params.success ? params.data.sortBy : undefined;
+  const sortOrder = params.success ? params.data.sortOrder : undefined;
+
+  const filter: Record<string, unknown> = {};
   if (params.success) {
-    if (params.data.status) conditions.push(eq(invoicesTable.status, params.data.status));
-    if (params.data.search) conditions.push(ilike(invoicesTable.supplierName, `%${params.data.search}%`));
-    if (params.data.supplierId) conditions.push(eq(invoicesTable.matchedSupplierId, parseInt(params.data.supplierId)));
-    if (params.data.dateFrom) conditions.push(gte(invoicesTable.invoiceDate, params.data.dateFrom));
-    if (params.data.dateTo) conditions.push(lte(invoicesTable.invoiceDate, params.data.dateTo));
+    if (params.data.status) filter.status = params.data.status;
+    if (params.data.search) filter.supplierName = { $regex: params.data.search, $options: "i" };
+    if (params.data.supplierId) filter.matchedSupplierId = params.data.supplierId;
+    if (params.data.dateFrom) filter.invoiceDate = { $gte: params.data.dateFrom };
+    if (params.data.dateTo) filter.invoiceDate = { ...(filter.invoiceDate as object || {}), $lte: params.data.dateTo };
   }
-  const where = conditions.length > 0 ? and(...conditions) : undefined;
-  const rows = await db.select().from(invoicesTable).where(where).limit(limit).offset(offset).orderBy(invoicesTable.createdAt);
-  const [{ count }] = await db.select({ count: sql<number>`count(*)` }).from(invoicesTable).where(where);
-  res.json({ data: rows.map(formatInvoice), total: Number(count), page, limit });
+
+  const result = await findInvoices(filter, { page, limit, sortBy, sortOrder });
+  res.json({ data: result.data.map(formatInvoice), total: result.total, page, limit, sortBy: result.sortBy, sortOrder: result.sortOrder });
 });
 
-async function runExtraction(invId: number, filePath: string, fileType: string) {
+async function runExtraction(invId: string, filePath: string, fileType: string) {
   try {
-    await db.update(invoicesTable).set({ status: "extracting" }).where(eq(invoicesTable.id, invId));
+    await updateInvoice(invId, { status: "extracting" });
     const extracted = await extractInvoiceWithAI(filePath, fileType);
-    const suppliers = await db.select({ id: suppliersTable.id, name: suppliersTable.name, gstin: suppliersTable.gstin }).from(suppliersTable);
+    const suppliersResult = await findSuppliers({}, { limit: 1000 });
+    const suppliers = suppliersResult.data.map(s => ({ id: s._id.toHexString(), name: s.name, gstin: s.gstin }));
     const matchResult = await matchSupplierWithAI(extracted.supplierName, extracted.supplierGstin, suppliers);
     let matchedSupplierName: string | null = null;
     if (matchResult.matchedId) {
       const matched = suppliers.find((s) => s.id === matchResult.matchedId);
       matchedSupplierName = matched?.name ?? null;
     }
-    await db.update(invoicesTable).set({
+    await updateInvoice(invId, {
       status: "extracted",
       supplierName: extracted.supplierName,
       supplierGstin: extracted.supplierGstin,
@@ -114,15 +125,15 @@ async function runExtraction(invId: number, filePath: string, fileType: string) 
       sgst: extracted.sgst?.toString() ?? null,
       igst: extracted.igst?.toString() ?? null,
       grandTotal: extracted.grandTotal?.toString() ?? null,
-      items: extracted.items as unknown as typeof invoicesTable.$inferInsert["items"],
+      items: extracted.items,
       confidenceScore: extracted.confidenceScore.toString(),
-      matchedSupplierId: matchResult.matchedId,
+      matchedSupplierId: matchResult.matchedId ?? undefined,
       matchedSupplierName,
       supplierMatchStatus: matchResult.matchedId ? "matched" : "unmatched",
       extractedAt: new Date(),
-    }).where(eq(invoicesTable.id, invId));
+    });
   } catch {
-    await db.update(invoicesTable).set({ status: "failed" }).where(eq(invoicesTable.id, invId));
+    await updateInvoice(invId, { status: "failed" });
   }
 }
 
@@ -135,45 +146,40 @@ router.post("/invoices/upload", authenticate, upload.array("files", 20), async (
   const inserted = [];
   for (const file of files) {
     const ext = path.extname(file.originalname).slice(1).toLowerCase();
-    const [inv] = await db.insert(invoicesTable).values({
+    const inv = await createInvoice({
       fileName: file.originalname,
       fileUrl: getFileUrl(file.filename),
       fileType: ext,
       status: "pending",
       uploadedBy: req.user!.userId,
       items: [],
-    }).returning();
-    await logAudit(req, "invoice_uploaded", "invoice", String(inv!.id), file.originalname);
-    inserted.push(formatInvoice(inv!));
-    // Auto-extract in background — don't block the response
+    });
+    await logAudit(req, "invoice_uploaded", "invoice", inv._id.toHexString(), file.originalname);
+    inserted.push(formatInvoice(inv));
     const filePath = path.join(UPLOAD_DIR, file.filename);
-    setImmediate(() => runExtraction(inv!.id, filePath, ext));
+    setImmediate(() => runExtraction(inv._id.toHexString(), filePath, ext));
   }
   res.status(201).json(inserted);
 });
 
 router.get("/invoices/:invoiceId", authenticate, async (req, res): Promise<void> => {
-  const rawId = Array.isArray(req.params.invoiceId) ? req.params.invoiceId[0] : req.params.invoiceId;
-  const id = parseInt(rawId, 10);
-  const [inv] = await db.select().from(invoicesTable).where(eq(invoicesTable.id, id));
+  const invoiceId = req.params.invoiceId;
+  const inv = await findInvoiceById(invoiceId);
   if (!inv) { res.status(404).json({ error: "Invoice not found" }); return; }
   res.json(formatInvoice(inv));
 });
 
 router.put("/invoices/:invoiceId", authenticate, async (req, res): Promise<void> => {
-  const rawId = Array.isArray(req.params.invoiceId) ? req.params.invoiceId[0] : req.params.invoiceId;
-  const id = parseInt(rawId, 10);
+  const invoiceId = req.params.invoiceId;
   const parsed = UpdateInvoiceBody.safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ error: parsed.error.message }); return; }
 
-  // Fetch current values for diff
-  const [existing] = await db.select().from(invoicesTable).where(eq(invoicesTable.id, id));
+  const existing = await findInvoiceById(invoiceId);
   if (!existing) { res.status(404).json({ error: "Invoice not found" }); return; }
 
   const { remark, ...fields } = parsed.data;
 
-  // Build a human-readable before/after diff for scalar fields
-  const scalarFields: Array<{ key: keyof typeof fields; label: string }> = [
+  const scalarFields: Array<{ key: string; label: string }> = [
     { key: "invoiceNumber", label: "Invoice Number" },
     { key: "invoiceDate", label: "Invoice Date" },
     { key: "supplierName", label: "Supplier Name" },
@@ -189,7 +195,7 @@ router.put("/invoices/:invoiceId", authenticate, async (req, res): Promise<void>
   const changes: Array<{ field: string; from: unknown; to: unknown }> = [];
   for (const { key, label } of scalarFields) {
     if (key in fields) {
-      const oldVal = existing[key as keyof typeof existing];
+      const oldVal = (existing as Record<string, unknown>)[key];
       const newVal = (fields as Record<string, unknown>)[key];
       const oldStr = oldVal !== null && oldVal !== undefined ? String(oldVal) : "";
       const newStr = newVal !== null && newVal !== undefined ? String(newVal) : "";
@@ -198,51 +204,43 @@ router.put("/invoices/:invoiceId", authenticate, async (req, res): Promise<void>
       }
     }
   }
-  // Note items change without full diff (too verbose)
   if ("items" in fields && JSON.stringify(existing.items) !== JSON.stringify(fields.items)) {
     changes.push({ field: "Line Items", from: `${(existing.items as unknown[])?.length ?? 0} items`, to: `${(fields.items as unknown[])?.length ?? 0} items` });
   }
 
-  const updateData: Partial<typeof invoicesTable.$inferSelect> = { ...fields } as unknown as Partial<typeof invoicesTable.$inferSelect>;
-  if (fields.matchedSupplierId) {
-    (updateData as Record<string, unknown>).matchedSupplierId = parseInt(fields.matchedSupplierId);
-  }
+  const updateData: Record<string, unknown> = { ...fields, status: "reviewing" };
 
-  const [inv] = await db.update(invoicesTable)
-    .set({ ...updateData, status: "reviewing" } as unknown as typeof invoicesTable.$inferInsert)
-    .where(eq(invoicesTable.id, id))
-    .returning();
+  const inv = await updateInvoice(invoiceId, updateData as Partial<Invoice>);
   if (!inv) { res.status(404).json({ error: "Invoice not found" }); return; }
 
   const auditDetails = JSON.stringify({ remark, changes });
-  await logAudit(req, "invoice_edited", "invoice", String(id), auditDetails);
+  await logAudit(req, "invoice_edited", "invoice", invoiceId, auditDetails);
   res.json(formatInvoice(inv));
 });
 
 router.delete("/invoices/:invoiceId", authenticate, async (req, res): Promise<void> => {
-  const rawId = Array.isArray(req.params.invoiceId) ? req.params.invoiceId[0] : req.params.invoiceId;
-  const id = parseInt(rawId, 10);
-  const [inv] = await db.delete(invoicesTable).where(eq(invoicesTable.id, id)).returning();
+  const invoiceId = req.params.invoiceId;
+  const inv = await deleteInvoice(invoiceId);
   if (!inv) { res.status(404).json({ error: "Invoice not found" }); return; }
   const filePath = path.join(UPLOAD_DIR, path.basename(inv.fileUrl));
   if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  await logAudit(req, "invoice_deleted", "invoice", String(id));
+  await logAudit(req, "invoice_deleted", "invoice", invoiceId);
   res.json({ message: "Invoice deleted" });
 });
 
 router.post("/invoices/:invoiceId/extract", authenticate, async (req, res): Promise<void> => {
-  const rawId = Array.isArray(req.params.invoiceId) ? req.params.invoiceId[0] : req.params.invoiceId;
-  const id = parseInt(rawId, 10);
-  const [inv] = await db.select().from(invoicesTable).where(eq(invoicesTable.id, id));
+  const invoiceId = req.params.invoiceId;
+  const inv = await findInvoiceById(invoiceId);
   if (!inv) { res.status(404).json({ error: "Invoice not found" }); return; }
 
-  await db.update(invoicesTable).set({ status: "extracting" }).where(eq(invoicesTable.id, id));
+  await updateInvoice(invoiceId, { status: "extracting" });
 
   try {
     const filePath = path.join(UPLOAD_DIR, path.basename(inv.fileUrl));
     const extracted = await extractInvoiceWithAI(filePath, inv.fileType);
 
-    const suppliers = await db.select({ id: suppliersTable.id, name: suppliersTable.name, gstin: suppliersTable.gstin }).from(suppliersTable);
+    const suppliersResult = await findSuppliers({}, { limit: 1000 });
+    const suppliers = suppliersResult.data.map(s => ({ id: s._id.toHexString(), name: s.name, gstin: s.gstin }));
     const matchResult = await matchSupplierWithAI(extracted.supplierName, extracted.supplierGstin, suppliers);
 
     let matchedSupplierName: string | null = null;
@@ -251,7 +249,7 @@ router.post("/invoices/:invoiceId/extract", authenticate, async (req, res): Prom
       matchedSupplierName = matched?.name ?? null;
     }
 
-    const [updated] = await db.update(invoicesTable).set({
+    const updated = await updateInvoice(invoiceId, {
       status: "extracted",
       supplierName: extracted.supplierName,
       supplierGstin: extracted.supplierGstin,
@@ -263,62 +261,59 @@ router.post("/invoices/:invoiceId/extract", authenticate, async (req, res): Prom
       sgst: extracted.sgst?.toString() ?? null,
       igst: extracted.igst?.toString() ?? null,
       grandTotal: extracted.grandTotal?.toString() ?? null,
-      items: extracted.items as unknown as typeof invoicesTable.$inferInsert["items"],
+      items: extracted.items,
       confidenceScore: extracted.confidenceScore.toString(),
-      matchedSupplierId: matchResult.matchedId,
+      matchedSupplierId: matchResult.matchedId ?? undefined,
       matchedSupplierName,
       supplierMatchStatus: matchResult.matchedId ? "matched" : "unmatched",
       extractedAt: new Date(),
-    }).where(eq(invoicesTable.id, id)).returning();
+    });
 
-    await logAudit(req, "invoice_extracted", "invoice", String(id), `Confidence: ${extracted.confidenceScore}`);
+    await logAudit(req, "invoice_extracted", "invoice", invoiceId, `Confidence: ${extracted.confidenceScore}`);
     res.json(formatInvoice(updated!));
   } catch (err) {
-    await db.update(invoicesTable).set({ status: "failed" }).where(eq(invoicesTable.id, id));
+    await updateInvoice(invoiceId, { status: "failed" });
     req.log.error({ err }, "Invoice extraction failed");
     res.status(500).json({ error: "Extraction failed" });
   }
 });
 
 router.post("/invoices/:invoiceId/match-supplier", authenticate, async (req, res): Promise<void> => {
-  const rawId = Array.isArray(req.params.invoiceId) ? req.params.invoiceId[0] : req.params.invoiceId;
-  const id = parseInt(rawId, 10);
+  const invoiceId = req.params.invoiceId;
   const parsed = MatchSupplierBody.safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ error: parsed.error.message }); return; }
 
-  const supplierId = parsed.data.supplierId ? parseInt(parsed.data.supplierId) : null;
+  const supplierId = parsed.data.supplierId ?? null;
   let matchedSupplierName: string | null = null;
   if (supplierId) {
-    const [s] = await db.select().from(suppliersTable).where(eq(suppliersTable.id, supplierId));
-    matchedSupplierName = s?.name ?? null;
+    const supplier = await findSuppliers({ _id: { $oid: supplierId } }, { limit: 1 });
+    matchedSupplierName = supplier.data[0]?.name ?? null;
   }
 
-  const [inv] = await db.update(invoicesTable).set({
-    matchedSupplierId: supplierId,
+  const inv = await updateInvoice(invoiceId, {
+    matchedSupplierId: supplierId ?? undefined,
     matchedSupplierName,
     supplierMatchStatus: supplierId ? "manual" : "unmatched",
-  }).where(eq(invoicesTable.id, id)).returning();
+  });
 
   if (!inv) { res.status(404).json({ error: "Invoice not found" }); return; }
   res.json(formatInvoice(inv));
 });
 
 router.post("/invoices/:invoiceId/approve", authenticate, requireRole("admin", "accounts", "purchase_manager"), async (req, res): Promise<void> => {
-  const rawId = Array.isArray(req.params.invoiceId) ? req.params.invoiceId[0] : req.params.invoiceId;
-  const id = parseInt(rawId, 10);
-  const [inv] = await db.update(invoicesTable).set({ status: "approved" }).where(eq(invoicesTable.id, id)).returning();
+  const invoiceId = req.params.invoiceId;
+  const inv = await updateInvoice(invoiceId, { status: "approved" });
   if (!inv) { res.status(404).json({ error: "Invoice not found" }); return; }
-  await logAudit(req, "invoice_approved", "invoice", String(id));
+  await logAudit(req, "invoice_approved", "invoice", invoiceId);
   res.json(formatInvoice(inv));
 });
 
 router.post("/invoices/:invoiceId/push-to-erp", authenticate, requireRole("admin", "accounts", "purchase_manager"), async (req, res): Promise<void> => {
-  const rawId = Array.isArray(req.params.invoiceId) ? req.params.invoiceId[0] : req.params.invoiceId;
-  const id = parseInt(rawId, 10);
-  const [inv] = await db.select().from(invoicesTable).where(eq(invoicesTable.id, id));
+  const invoiceId = req.params.invoiceId;
+  const inv = await findInvoiceById(invoiceId);
   if (!inv) { res.status(404).json({ error: "Invoice not found" }); return; }
 
-  const [conn] = await db.select().from(erpConnectionsTable).limit(1);
+  const conn = await getErpConnection();
   if (!conn?.isConnected) {
     res.json({ success: false, erpDocumentId: null, status: "failed", message: "ERP not connected" });
     return;
@@ -353,18 +348,18 @@ router.post("/invoices/:invoiceId/push-to-erp", authenticate, requireRole("admin
     if (response.ok) {
       const data = await response.json() as { data?: { name?: string } };
       const erpDocumentId = data.data?.name ?? null;
-      await db.update(invoicesTable).set({ status: "pushed", erpDocumentId, erpStatus: "Draft", erpError: null }).where(eq(invoicesTable.id, id));
-      await logAudit(req, "erp_push_success", "invoice", String(id), erpDocumentId ?? undefined);
+      await updateInvoice(invoiceId, { status: "pushed", erpDocumentId, erpStatus: "Draft", erpError: undefined });
+      await logAudit(req, "erp_push_success", "invoice", invoiceId, erpDocumentId ?? undefined);
       res.json({ success: true, erpDocumentId, status: "Draft", message: "Purchase invoice created in ERPNext" });
     } else {
       const errText = await response.text();
-      await db.update(invoicesTable).set({ status: "failed", erpStatus: "Failed", erpError: errText }).where(eq(invoicesTable.id, id));
-      await logAudit(req, "erp_push_failed", "invoice", String(id), errText);
+      await updateInvoice(invoiceId, { status: "failed", erpStatus: "Failed", erpError: errText });
+      await logAudit(req, "erp_push_failed", "invoice", invoiceId, errText);
       res.json({ success: false, erpDocumentId: null, status: "Failed", message: errText });
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Unknown error";
-    await db.update(invoicesTable).set({ status: "failed", erpStatus: "Failed", erpError: msg }).where(eq(invoicesTable.id, id));
+    await updateInvoice(invoiceId, { status: "failed", erpStatus: "Failed", erpError: msg });
     res.json({ success: false, erpDocumentId: null, status: "Failed", message: msg });
   }
 });

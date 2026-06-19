@@ -1,20 +1,24 @@
 import { Router } from "express";
 import multer from "multer";
 import path from "path";
-import { db, gstr2bRecordsTable } from "@workspace/db";
-import { ilike, and, eq, sql } from "drizzle-orm";
 import { authenticate } from "../lib/auth";
 import { logAudit } from "../lib/audit";
 import { ListGstr2bRecordsQueryParams } from "@workspace/api-zod";
 import * as XLSX from "xlsx";
 import { UPLOAD_DIR } from "../lib/storage";
+import {
+  findGstr2bRecords,
+  getDistinctPeriods,
+  createGstr2bRecords,
+} from "../lib/dal";
+import { Gstr2bRecord } from "../lib/schemas";
 
 const router = Router();
 const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 10 * 1024 * 1024 } });
 
-function formatRecord(r: typeof gstr2bRecordsTable.$inferSelect) {
+function formatRecord(r: Gstr2bRecord & { _id: { toHexString: () => string } }) {
   return {
-    id: String(r.id),
+    id: r._id.toHexString(),
     period: r.period,
     supplierGstin: r.supplierGstin,
     supplierName: r.supplierName,
@@ -25,6 +29,7 @@ function formatRecord(r: typeof gstr2bRecordsTable.$inferSelect) {
     sgst: Number(r.sgst),
     igst: Number(r.igst),
     createdAt: r.createdAt.toISOString(),
+    updatedAt: r.updatedAt.toISOString(),
   };
 }
 
@@ -32,16 +37,17 @@ router.get("/gstr2b", authenticate, async (req, res): Promise<void> => {
   const params = ListGstr2bRecordsQueryParams.safeParse(req.query);
   const page = params.success ? (params.data.page ?? 1) : 1;
   const limit = params.success ? (params.data.limit ?? 20) : 20;
-  const offset = (page - 1) * limit;
-  const conditions = [];
+  const sortBy = params.success ? params.data.sortBy : undefined;
+  const sortOrder = params.success ? params.data.sortOrder : undefined;
+
+  const filter: Record<string, unknown> = {};
   if (params.success) {
-    if (params.data.search) conditions.push(ilike(gstr2bRecordsTable.supplierName, `%${params.data.search}%`));
-    if (params.data.period) conditions.push(eq(gstr2bRecordsTable.period, params.data.period));
+    if (params.data.search) filter.supplierName = { $regex: params.data.search, $options: "i" };
+    if (params.data.period) filter.period = params.data.period;
   }
-  const where = conditions.length > 0 ? and(...conditions) : undefined;
-  const rows = await db.select().from(gstr2bRecordsTable).where(where).limit(limit).offset(offset);
-  const [{ count }] = await db.select({ count: sql<number>`count(*)` }).from(gstr2bRecordsTable).where(where);
-  res.json({ data: rows.map(formatRecord), total: Number(count), page, limit });
+
+  const result = await findGstr2bRecords(filter, { page, limit, sortBy, sortOrder });
+  res.json({ data: result.data.map(formatRecord), total: result.total, page, limit, sortBy: result.sortBy, sortOrder: result.sortOrder });
 });
 
 router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, res): Promise<void> => {
@@ -62,17 +68,14 @@ router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, r
       return str;
     }
 
-    // Detect government GSTR-2B format: has a "B2B" sheet
     const isGovtFormat = workbook.SheetNames.includes("B2B");
 
     let imported = 0;
     let skipped = 0;
     const errors: string[] = [];
+    const records: Array<Omit<Gstr2bRecord, "_id" | "createdAt" | "updatedAt">> = [];
 
     if (isGovtFormat) {
-      // Government GSTR-2B Excel: B2B sheet with positional columns, data from row index 5
-      // [0]=GSTIN [1]=Name [2]=InvNo [3]=Type [4]=Date(DD/MM/YYYY) [5]=InvValue
-      // [8]=TaxableValue [9]=IGST [10]=CGST [11]=SGST [12]=Cess
       const b2bRaw = XLSX.utils.sheet_to_json(workbook.Sheets["B2B"]!, { header: 1, defval: "" }) as unknown[][];
       const b2bData = b2bRaw.slice(5).filter((r) => r[0] !== "" && r[2] !== "");
 
@@ -86,17 +89,14 @@ router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, r
         const cgst    = Number(row[10]) || 0;
         const sgst    = Number(row[11]) || 0;
         if (!gstin || !invNo) { skipped++; continue; }
-        try {
-          await db.insert(gstr2bRecordsTable).values({
-            period, supplierGstin: gstin, supplierName: name || gstin,
-            invoiceNumber: invNo, invoiceDate: invDate || new Date().toISOString().split("T")[0]!,
-            taxableValue: taxable.toFixed(2), cgst: cgst.toFixed(2), sgst: sgst.toFixed(2), igst: igst.toFixed(2),
-          }).onConflictDoNothing();
-          imported++;
-        } catch { skipped++; }
+        records.push({
+          period, supplierGstin: gstin, supplierName: name || gstin,
+          invoiceNumber: invNo, invoiceDate: invDate || new Date().toISOString().split("T")[0]!,
+          taxableValue: taxable.toFixed(2), cgst: cgst.toFixed(2), sgst: sgst.toFixed(2), igst: igst.toFixed(2),
+        });
+        imported++;
       }
 
-      // Also import B2B-CDNR (credit/debit notes) if present
       if (workbook.SheetNames.includes("B2B-CDNR")) {
         const cdnrRaw = XLSX.utils.sheet_to_json(workbook.Sheets["B2B-CDNR"]!, { header: 1, defval: "" }) as unknown[][];
         const cdnrData = cdnrRaw.slice(5).filter((r) => r[0] !== "" && r[2] !== "");
@@ -110,18 +110,15 @@ router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, r
           const cgst    = Number(row[11]) || 0;
           const sgst    = Number(row[12]) || 0;
           if (!gstin) { skipped++; continue; }
-          try {
-            await db.insert(gstr2bRecordsTable).values({
-              period, supplierGstin: gstin, supplierName: name || gstin,
-              invoiceNumber: noteNo, invoiceDate: noteDate || new Date().toISOString().split("T")[0]!,
-              taxableValue: taxable.toFixed(2), cgst: cgst.toFixed(2), sgst: sgst.toFixed(2), igst: igst.toFixed(2),
-            }).onConflictDoNothing();
-            imported++;
-          } catch { skipped++; }
+          records.push({
+            period, supplierGstin: gstin, supplierName: name || gstin,
+            invoiceNumber: noteNo, invoiceDate: noteDate || new Date().toISOString().split("T")[0]!,
+            taxableValue: taxable.toFixed(2), cgst: cgst.toFixed(2), sgst: sgst.toFixed(2), igst: igst.toFixed(2),
+          });
+          imported++;
         }
       }
     } else {
-      // Generic/custom format: use header-based parsing
       const sheet = workbook.Sheets[workbook.SheetNames[0]!]!;
       const rows = XLSX.utils.sheet_to_json(sheet) as Record<string, unknown>[];
       for (let i = 0; i < rows.length; i++) {
@@ -136,17 +133,21 @@ router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, r
           const sgst    = Number(row["SGST/UTGST"] ?? row["SGST"] ?? row["sgst"] ?? 0);
           const igst    = Number(row["IGST"] ?? row["igst"] ?? 0);
           if (!gstin || !invNo) { skipped++; continue; }
-          await db.insert(gstr2bRecordsTable).values({
+          records.push({
             period, supplierGstin: gstin, supplierName: name || gstin,
             invoiceNumber: invNo, invoiceDate: invDate || new Date().toISOString().split("T")[0]!,
             taxableValue: taxable.toFixed(2), cgst: cgst.toFixed(2), sgst: sgst.toFixed(2), igst: igst.toFixed(2),
-          }).onConflictDoNothing();
+          });
           imported++;
         } catch {
           errors.push(`Row ${i + 2}: Failed to process`);
           skipped++;
         }
       }
+    }
+
+    if (records.length > 0) {
+      await createGstr2bRecords(records);
     }
 
     await logAudit(req, "gstr2b_imported", "gstr2b", undefined, `Period: ${period}, Imported: ${imported}`);
@@ -158,11 +159,8 @@ router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, r
 });
 
 router.get("/gstr2b/periods", authenticate, async (_req, res): Promise<void> => {
-  const result = await db
-    .selectDistinct({ period: gstr2bRecordsTable.period })
-    .from(gstr2bRecordsTable)
-    .orderBy(gstr2bRecordsTable.period);
-  res.json(result.map((r) => r.period));
+  const periods = await getDistinctPeriods();
+  res.json(periods);
 });
 
 export default router;

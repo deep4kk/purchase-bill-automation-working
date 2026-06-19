@@ -5,19 +5,38 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Search, Plus } from "lucide-react";
+import { Search, Plus, ChevronUp, ChevronDown, ChevronsUpDown } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 
 export default function SuppliersList() {
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState<string>("updatedAt");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
   const limit = 20;
 
   const { data, isLoading } = useListSuppliers({
     page,
     limit,
-    search: search || undefined
+    search: search || undefined,
+    sortBy,
+    sortOrder,
   });
+
+  const handleSort = (column: string) => {
+    if (sortBy === column) {
+      setSortOrder(sortOrder === "asc" ? "desc" : "asc");
+    } else {
+      setSortBy(column);
+      setSortOrder("desc");
+    }
+    setPage(1);
+  };
+
+  const getSortIcon = (column: string) => {
+    if (sortBy !== column) return <ChevronsUpDown className="h-4 w-4 ml-1" />;
+    return sortOrder === "asc" ? <ChevronUp className="h-4 w-4 ml-1" /> : <ChevronDown className="h-4 w-4 ml-1" />;
+  };
 
   return (
     <div className="p-8 space-y-6 bg-background min-h-full">
@@ -52,11 +71,17 @@ export default function SuppliersList() {
             <Table>
               <TableHeader>
                 <TableRow className="bg-muted/50">
-                  <TableHead>Supplier Name</TableHead>
-                  <TableHead>GSTIN</TableHead>
+                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("name")}>
+                    <div className="flex items-center">Supplier Name {getSortIcon("name")}</div>
+                  </TableHead>
+                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("gstin")}>
+                    <div className="flex items-center">GSTIN {getSortIcon("gstin")}</div>
+                  </TableHead>
                   <TableHead>ERP Code</TableHead>
                   <TableHead>Contact</TableHead>
-                  <TableHead>Status</TableHead>
+                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("isMatched")}>
+                    <div className="flex items-center">Status {getSortIcon("isMatched")}</div>
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>

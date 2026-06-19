@@ -4,7 +4,7 @@ import type { Request, Response, NextFunction } from "express";
 const JWT_SECRET = process.env.JWT_SECRET || "invoice-gst-secret-key-change-in-production";
 
 export interface JwtPayload {
-  userId: number;
+  userId: string;
   email: string;
   role: string;
   name: string;

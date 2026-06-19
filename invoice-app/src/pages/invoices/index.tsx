@@ -8,17 +8,19 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Search, SlidersHorizontal, Eye } from "lucide-react";
+import { Search, SlidersHorizontal, Eye, ChevronUp, ChevronDown, ChevronsUpDown } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 
 export default function InvoicesList() {
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<ListInvoicesStatus | "all">("all");
+  const [sortBy, setSortBy] = useState<string>("updatedAt");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
   const limit = 20;
 
   const { data, isLoading } = useListInvoices(
-    { page, limit, search: search || undefined, status: status === "all" ? undefined : status },
+    { page, limit, search: search || undefined, status: status === "all" ? undefined : status, sortBy, sortOrder },
     {
       query: {
         refetchInterval: (query) => {
@@ -29,6 +31,21 @@ export default function InvoicesList() {
       },
     }
   );
+
+  const handleSort = (column: string) => {
+    if (sortBy === column) {
+      setSortOrder(sortOrder === "asc" ? "desc" : "asc");
+    } else {
+      setSortBy(column);
+      setSortOrder("desc");
+    }
+    setPage(1);
+  };
+
+  const getSortIcon = (column: string) => {
+    if (sortBy !== column) return <ChevronsUpDown className="h-4 w-4 ml-1" />;
+    return sortOrder === "asc" ? <ChevronUp className="h-4 w-4 ml-1" /> : <ChevronDown className="h-4 w-4 ml-1" />;
+  };
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -92,11 +109,21 @@ export default function InvoicesList() {
             <Table>
               <TableHeader>
                 <TableRow className="bg-muted/50">
-                  <TableHead>Invoice #</TableHead>
-                  <TableHead>Date</TableHead>
-                  <TableHead>Supplier</TableHead>
-                  <TableHead>Amount</TableHead>
-                  <TableHead>Status</TableHead>
+                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("invoiceNumber")}>
+                    <div className="flex items-center">Invoice # {getSortIcon("invoiceNumber")}</div>
+                  </TableHead>
+                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("invoiceDate")}>
+                    <div className="flex items-center">Date {getSortIcon("invoiceDate")}</div>
+                  </TableHead>
+                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("supplierName")}>
+                    <div className="flex items-center">Supplier {getSortIcon("supplierName")}</div>
+                  </TableHead>
+                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("grandTotal")}>
+                    <div className="flex items-center">Amount {getSortIcon("grandTotal")}</div>
+                  </TableHead>
+                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("status")}>
+                    <div className="flex items-center">Status {getSortIcon("status")}</div>
+                  </TableHead>
                   <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
