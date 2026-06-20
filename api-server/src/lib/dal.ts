@@ -12,6 +12,9 @@ import {
   COLLECTIONS,
 } from "./schemas";
 
+export { getDb } from "./mongodb";
+export { COLLECTIONS } from "./schemas";
+
 // Helper to convert string ID to ObjectId
 export function toObjectId(id: string | number): ObjectId {
   return new ObjectId(id);

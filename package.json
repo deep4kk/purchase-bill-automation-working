@@ -1,0 +1,23 @@
+{
+  "name": "purchase-bill-automation",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "api-server",
+    "invoice-app",
+    "lib/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w @workspace/api-server",
+    "dev:app": "npm run dev -w @workspace/invoice-app",
+    "build": "npm run build -w @workspace/api-server && npm run build -w @workspace/invoice-app",
+    "build:api": "npm run build -w @workspace/api-server",
+    "build:app": "npm run build -w @workspace/invoice-app",
+    "start:api": "npm run start -w @workspace/api-server",
+    "start:app": "npm run preview -w @workspace/invoice-app",
+    "typecheck": "npm run typecheck -w @workspace/api-server && npm run typecheck -w @workspace/invoice-app"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

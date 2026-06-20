@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+/api-server/node_modules/
+/invoice-app/node_modules/
+
+# Build output
+dist/
+build/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

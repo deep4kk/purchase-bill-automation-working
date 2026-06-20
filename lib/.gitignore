@@ -1,0 +1,9 @@
+/api-server/node_modules
+/invoice-app/node_modules
+/node_modules
+dist
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
