@@ -190,6 +190,309 @@ pm2 startup
 
 ---
 
+## Option 5: AWS EC2 Deployment (Complete Guide)
+
+This guide deploys the application on AWS EC2 with:
+- **Frontend**: Served via Nginx on port 80
+- **API Server**: Running on port 5000 (internal)
+- **MongoDB**: Using MongoDB Atlas (cloud) - recommended for production
+- **SSL**: Optional with Certbot
+
+### Step 1: Launch EC2 Instance
+
+1. Go to AWS Console → EC2 → **Launch Instance**
+2. Configure:
+   - **Name**: `purchase-bill-app`
+   - **Amazon Machine Image (AMI)**: `Ubuntu 22.04 LTS`
+   - **Instance Type**: `t3.medium` (or `t3.small` for testing)
+   - **Key Pair**: Create or select existing
+   - **Network Settings**:
+     - Allow SSH (port 22) from My IP
+     - Allow HTTP (port 80) from anywhere
+     - Allow HTTPS (port 443) from anywhere
+     - Allow Custom TCP (port 5000) from anywhere (for API)
+3. **Storage**: 20 GB gp3
+4. Click **Launch Instance**
+
+### Step 2: Connect to EC2
+
+```bash
+# Replace with your key path and instance IP
+chmod 400 your-key.pem
+ssh -i your-key.pem ubuntu@your-ec2-public-ip
+```
+
+### Step 3: Install Dependencies
+
+```bash
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install Node.js 18
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# Verify installation
+node -v  # Should show v18.x.x
+npm -v
+
+# Install pnpm
+npm install -g pnpm
+
+# Install PM2 for process management
+npm install -g pm2
+
+# Install Nginx
+sudo apt install -y nginx
+
+# Install Certbot for SSL (optional)
+sudo apt install -y certbot python3-certbot-nginx
+```
+
+### Step 4: Clone Repository
+
+```bash
+# Clone the repository
+git clone https://github.com/deep4kk/purchase-bill-automation-working.git
+cd purchase-bill-automation-working
+
+# Install API dependencies
+cd api-server
+pnpm install
+pnpm run build
+```
+
+### Step 5: Configure Environment
+
+```bash
+cd /home/ubuntu/purchase-bill-automation-working/api-server
+
+# Create .env file
+cat > .env << 'EOF'
+# MongoDB Atlas Connection (REPLACE WITH YOUR ATLAS CREDENTIALS)
+MONGODB_URI=mongodb+srv://<username>:<password>@cluster.xxxxx.mongodb.net
+MONGODB_DB=purchase_bill_automation
+
+# JWT Secret (generate a strong random string)
+JWT_SECRET=your-super-secure-jwt-secret-key-minimum-32-characters
+
+# Server Configuration
+PORT=5000
+BASE_PATH=/api
+NODE_ENV=production
+
+# File Upload
+UPLOAD_DIR=./uploads
+MAX_FILE_SIZE=20971520
+
+# Optional: AI API Keys
+GOOGLE_API_KEY=your-gemini-api-key
+OPENAI_API_KEY=your-openai-api-key
+EOF
+
+# Create uploads directory
+mkdir -p uploads
+```
+
+### Step 6: Build Frontend
+
+```bash
+cd /home/ubuntu/purchase-bill-automation-working/invoice-app
+
+# Create frontend env
+cat > .env << 'EOF'
+VITE_API_URL=http://your-ec2-public-ip:5000
+BASE_PATH=/
+EOF
+
+# Install and build
+pnpm install
+pnpm run build
+```
+
+### Step 7: Configure PM2 for API
+
+```bash
+cd /home/ubuntu/purchase-bill-automation-working/api-server
+
+# Start API with PM2
+pm2 start pnpm --name "purchase-bill-api" -- run start
+
+# Save PM2 configuration
+pm2 save
+
+# Setup PM2 startup script
+sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u ubuntu --hp /home/ubuntu
+
+# Check status
+pm2 status
+pm2 logs purchase-bill-api
+```
+
+### Step 8: Configure Nginx
+
+```bash
+# Create Nginx configuration
+sudo nano /etc/nginx/sites-available/purchase-bill
+```
+
+Paste this configuration:
+
+```nginx
+# Frontend - serving static files
+server {
+    listen 80;
+    server_name your-domain.com;  # Or your EC2 public IP
+
+    root /home/ubuntu/purchase-bill-automation-working/invoice-app/dist;
+    index index.html;
+
+    # Gzip compression
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # API Proxy
+    location /api/ {
+        proxy_pass http://localhost:5000/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
+        proxy_request_buffering off;
+        client_max_body_size 50M;
+    }
+
+    # Uploads (if needed for file access)
+    location /uploads/ {
+        alias /home/ubuntu/purchase-bill-automation-working/api-server/uploads/;
+        expires 1d;
+    }
+}
+```
+
+```bash
+# Enable the site
+sudo ln -s /etc/nginx/sites-available/purchase-bill /etc/nginx/sites-enabled/
+
+# Test configuration
+sudo nginx -t
+
+# Reload Nginx
+sudo systemctl reload nginx
+```
+
+### Step 9: (Optional) Setup SSL with Let's Encrypt
+
+```bash
+# Install Certbot
+sudo certbot --nginx -d your-domain.com
+
+# Auto-renewal is automatically set up
+sudo systemctl status certbot.timer
+```
+
+### Step 10: Configure Firewall (UFW)
+
+```bash
+# Allow SSH, HTTP, HTTPS
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+
+# Enable firewall
+sudo ufw enable
+sudo ufw status
+```
+
+### Step 11: Verify Deployment
+
+Test from your local machine:
+
+```bash
+# Test API
+curl http://your-ec2-public-ip:5000/health
+
+# Test Frontend (should return HTML)
+curl http://your-ec2-public-ip/
+
+# Test API through Nginx proxy
+curl http://your-ec2-public-ip/api/health
+```
+
+### MongoDB Atlas Setup (Required for Production)
+
+1. Go to https://mongodb.com/atlas
+2. Create free cluster (M0 Sandbox)
+3. Create database user:
+   - Username: `purchase_bill_user`
+   - Password: (generate secure password)
+4. Network Access → Add IP `0.0.0.0/0` (or your EC2 IP)
+5. Get connection string:
+   ```
+   mongodb+srv://purchase_bill_user:<password>@cluster.xxxxx.mongodb.net
+   ```
+6. Update `.env` file on EC2:
+   ```bash
+   nano /home/ubuntu/purchase-bill-automation-working/api-server/.env
+   # Update MONGODB_URI with your Atlas connection string
+   pm2 restart purchase-bill-api
+   ```
+
+### Update Frontend API URL
+
+If using domain with SSL, update frontend:
+
+```bash
+cd /home/ubuntu/purchase-bill-automation-working/invoice-app
+echo "VITE_API_URL=https://your-domain.com" > .env
+pnpm run build
+```
+
+### Useful Commands
+
+```bash
+# View API logs
+pm2 logs purchase-bill-api
+
+# Restart API
+pm2 restart purchase-bill-api
+
+# View Nginx logs
+sudo tail -f /var/log/nginx/error.log
+sudo tail -f /var/log/nginx/access.log
+
+# Check Nginx status
+sudo systemctl status nginx
+
+# Update application
+cd /home/ubuntu/purchase-bill-automation-working
+git pull origin main
+cd api-server && pnpm install && pnpm run build && pm2 restart purchase-bill-api
+cd ../invoice-app && pnpm install && pnpm run build
+```
+
+### Cost Estimate (AWS EC2)
+
+| Resource | Configuration | Monthly Cost |
+|----------|--------------|--------------|
+| EC2 t3.micro | 2 vCPU, 1GB RAM | ~$10 |
+| EC2 t3.small | 2 vCPU, 2GB RAM | ~$20 |
+| Data Transfer | ~10GB/month | ~$1 |
+| MongoDB Atlas | M0 (512MB, free) | $0 |
+| **Total** | | ~$10-20/month |
+
+---
+
 ## Environment Variables Reference
 
 ### API Server (`api-server/.env`)
