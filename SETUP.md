@@ -190,6 +190,64 @@ pm2 startup
 
 ---
 
+## Troubleshooting
+
+### Error: "DATABASE_URL must be set"
+
+This error means your local copy has **OLD CODE**. You need to update:
+
+```bash
+# Option 1: Delete and re-clone (recommended for fresh start)
+cd ..
+rm -rf purchase-bill-automation-working
+git clone https://github.com/deep4kk/purchase-bill-automation-working.git
+cd purchase-bill-automation-working
+
+# Option 2: Pull latest changes
+cd purchase-bill-automation-working
+git pull origin main
+```
+
+### Windows-Specific Setup
+
+On Windows, use these commands instead of the Unix ones:
+
+```powershell
+# 1. Open PowerShell as Administrator and install pnpm
+npm install -g pnpm
+
+# 2. Clone repository
+git clone https://github.com/deep4kk/purchase-bill-automation-working.git
+cd purchase-bill-automation-working
+
+# 3. Install dependencies
+cd api-server
+pnpm install
+
+# 4. Build (run these separately on Windows)
+node ./build.mjs
+node ./dist/index.mjs
+
+# Or use the combined command:
+node --env-file=.env ./build.mjs && node --env-file=.env ./dist/index.mjs
+```
+
+**Note**: Windows doesn't support `export` command. Use `node --env-file=.env` instead.
+
+### Error: 'export' is not recognized
+
+This is a Windows issue. The scripts have been updated to be cross-platform. Pull the latest code or run commands manually:
+
+```powershell
+# Build
+node ./build.mjs
+
+# Start (after creating .env file with MongoDB URI)
+node --env-file=.env ./dist/index.mjs
+```
+
+---
+
 ## Option 5: AWS EC2 Deployment (Complete Guide)
 
 This guide deploys the application on AWS EC2 with:
