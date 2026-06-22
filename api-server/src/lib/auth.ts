@@ -1,7 +1,25 @@
 import jwt from "jsonwebtoken";
 import type { Request, Response, NextFunction } from "express";
+import { logger } from "./logger";
 
-const JWT_SECRET = process.env.JWT_SECRET || "invoice-gst-secret-key-change-in-production";
+function resolveJwtSecret(): string {
+  const secret = process.env.JWT_SECRET;
+  if (secret && secret.length >= 16) return secret;
+  const isProduction = process.env.NODE_ENV === "production";
+  if (isProduction) {
+    throw new Error(
+      "JWT_SECRET environment variable is required in production (min 16 chars).",
+    );
+  }
+  // Dev-only fallback. Never reach for the same string in production.
+  const devFallback = "dev-only-insecure-jwt-secret";
+  logger.warn(
+    "JWT_SECRET is not set — using an insecure dev fallback. Do NOT run this configuration in production.",
+  );
+  return devFallback;
+}
+
+const JWT_SECRET = resolveJwtSecret();
 
 export interface JwtPayload {
   userId: string;

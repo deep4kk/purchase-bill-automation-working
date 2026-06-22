@@ -7,12 +7,14 @@
     "dev": "node --env-file=.env ./build.mjs && node --env-file=.env ./dist/index.mjs",
     "build": "node ./build.mjs",
     "start": "node --env-file=.env ./dist/index.mjs",
+    "create-admin": "node --env-file=.env ./scripts/create-admin.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@google/genai": "^2.8.0",
     "@workspace/api-zod": "*",
     "bcryptjs": "^3.0.3",
+    "cloudinary": "^1.40.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "express": "^5.2.1",

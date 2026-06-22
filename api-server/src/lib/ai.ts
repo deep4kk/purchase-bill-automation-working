@@ -121,7 +121,7 @@ export async function extractInvoiceWithAI(filePath: string, fileType: string): 
     };
   } catch (err) {
     logger.error({ err }, "Gemini extraction failed");
-    return getMockExtraction();
+    throw err;
   }
 }
 

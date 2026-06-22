@@ -43,6 +43,7 @@ export interface Invoice extends BaseDocument {
   erpStatus?: string;
   erpError?: string;
   extractedAt?: Date;
+  extractionError?: string;
   remark?: string;
 }
 

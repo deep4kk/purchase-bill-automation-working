@@ -86,32 +86,26 @@ router.get("/dashboard/invoice-trend", authenticate, async (_req, res): Promise<
   const thirtyDaysAgo = new Date();
   thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-  // Simple approach: get all invoices from the last 30 days and aggregate by date in JS
-  const invoices = await db.collection(COLLECTIONS.INVOICES)
-    .find({ createdAt: { $gte: thirtyDaysAgo } })
-    .project({ createdAt: 1, status: 1 })
-    .toArray();
-
-  const dateMap = new Map<string, { count: number; pushed: number }>();
-  for (const inv of invoices) {
-    const date = inv.createdAt.toISOString().split("T")[0]!;
-    const existing = dateMap.get(date) ?? { count: 0, pushed: 0 };
-    existing.count++;
-    if (inv.status === "pushed") existing.pushed++;
-    dateMap.set(date, existing);
-  }
-
-  const rows = Array.from(dateMap.entries())
-    .map(([date, data]) => ({ date, count: data.count, pushed: data.pushed }))
-    .sort((a, b) => a.date.localeCompare(b.date));
+  const rows = await db.collection(COLLECTIONS.INVOICES).aggregate([
+    { $match: { createdAt: { $gte: thirtyDaysAgo } } },
+    {
+      $group: {
+        _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+        count: { $sum: 1 },
+        pushed: { $sum: { $cond: [{ $eq: ["$status", "pushed"] }, 1, 0] } },
+      },
+    },
+    { $sort: { _id: 1 } },
+    { $project: { _id: 0, date: "$_id", count: 1, pushed: 1 } },
+  ]).toArray();
 
   res.json(rows);
 });
 
 router.get("/dashboard/supplier-stats", authenticate, async (_req, res): Promise<void> => {
   const db = getDb();
-  const [total] = await db.collection(COLLECTIONS.SUPPLIERS).countDocuments();
-  const [matched] = await db.collection(COLLECTIONS.SUPPLIERS).countDocuments({ isMatched: true });
+  const total = await db.collection(COLLECTIONS.SUPPLIERS).countDocuments();
+  const matched = await db.collection(COLLECTIONS.SUPPLIERS).countDocuments({ isMatched: true });
 
   // Get top suppliers by invoice count
   const invoices = await db.collection(COLLECTIONS.INVOICES)

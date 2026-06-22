@@ -21,14 +21,16 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { toast } from "sonner";
-import { ArrowLeft, CheckCircle, Save, Trash2, Plus, Zap, Send, AlertTriangle } from "lucide-react";
+import { ArrowLeft, CheckCircle, Save, Trash2, Plus, Zap, Send, AlertTriangle, Eye, Download, X } from "lucide-react";
 
 export default function InvoiceReview() {
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
   const [isEditing, setIsEditing] = useState(false);
   const [remark, setRemark] = useState("");
+  const [showPreview, setShowPreview] = useState(false);
 
   const { data: invoice, isLoading } = useGetInvoice(id, { 
     query: { enabled: !!id, queryKey: getGetInvoiceQueryKey(id) } 
@@ -505,8 +507,93 @@ export default function InvoiceReview() {
               </div>
             </CardContent>
           </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Eye className="h-5 w-5" />
+                Invoice Preview
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {invoice?.fileUrl ? (
+                <>
+                  <div className="relative bg-slate-100 rounded-md overflow-hidden aspect-video flex items-center justify-center">
+                    {invoice.fileType === "application/pdf" ? (
+                      <div className="text-center space-y-2">
+                        <div className="text-4xl">📄</div>
+                        <p className="text-sm text-muted-foreground">{invoice.fileName}</p>
+                      </div>
+                    ) : (
+                      <img 
+                        src={invoice.fileUrl} 
+                        alt={invoice.fileName}
+                        className="max-w-full max-h-full object-contain"
+                      />
+                    )}
+                  </div>
+                  <div className="flex gap-2 pt-2">
+                    <Button 
+                      variant="outline" 
+                      className="flex-1" 
+                      onClick={() => setShowPreview(true)}
+                    >
+                      <Eye className="h-4 w-4 mr-2" />
+                      View Full
+                    </Button>
+                    <Button 
+                      variant="outline" 
+                      className="flex-1"
+                      asChild
+                    >
+                      <a href={invoice.fileUrl} download={invoice.fileName} target="_blank" rel="noopener noreferrer">
+                        <Download className="h-4 w-4 mr-2" />
+                        Download
+                      </a>
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <div className="text-center py-8 text-muted-foreground">
+                  <p>No file preview available</p>
+                </div>
+              )}
+            </CardContent>
+          </Card>
         </div>
       </div>
+
+      {/* Full Screen Preview Modal */}
+      <Dialog open={showPreview} onOpenChange={setShowPreview}>
+        <DialogContent className="max-w-4xl w-full max-h-[90vh] p-0">
+          <DialogHeader className="border-b p-4 flex flex-row items-center justify-between">
+            <DialogTitle>{invoice?.fileName}</DialogTitle>
+            <Button 
+              variant="ghost" 
+              size="icon"
+              onClick={() => setShowPreview(false)}
+              className="h-8 w-8"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </DialogHeader>
+          <div className="relative w-full max-h-[calc(90vh-80px)] overflow-auto bg-black flex items-center justify-center">
+            {invoice?.fileType === "application/pdf" ? (
+              <iframe
+                src={invoice.fileUrl}
+                className="w-full h-full min-h-[500px]"
+                title="Invoice PDF Preview"
+              />
+            ) : (
+              <img 
+                src={invoice?.fileUrl}
+                alt={invoice?.fileName}
+                className="max-w-full max-h-full object-contain"
+              />
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

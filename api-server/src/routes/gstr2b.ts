@@ -1,6 +1,5 @@
 import { Router } from "express";
 import multer from "multer";
-import path from "path";
 import { authenticate } from "../lib/auth";
 import { logAudit } from "../lib/audit";
 import { ListGstr2bRecordsQueryParams } from "@workspace/api-zod";
@@ -9,7 +8,7 @@ import { UPLOAD_DIR } from "../lib/storage";
 import {
   findGstr2bRecords,
   getDistinctPeriods,
-  createGstr2bRecords,
+  upsertGstr2bRecords,
 } from "../lib/dal";
 import { Gstr2bRecord } from "../lib/schemas";
 
@@ -77,9 +76,12 @@ router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, r
 
     if (isGovtFormat) {
       const b2bRaw = XLSX.utils.sheet_to_json(workbook.Sheets["B2B"]!, { header: 1, defval: "" }) as unknown[][];
-      const b2bData = b2bRaw.slice(5).filter((r) => r[0] !== "" && r[2] !== "");
+      // Govt B2B sheet has 5 header rows and expects 12 columns:
+      // [0]=gstin [1]=name [2]=invNo [3]=... [4]=invDate ... [8]=taxable [9]=igst [10]=cgst [11]=sgst
+      const b2bData = b2bRaw.slice(5).filter((r) => Array.isArray(r) && r.length >= 12 && r[0] !== "" && r[2] !== "");
 
-      for (const row of b2bData) {
+      for (let i = 0; i < b2bData.length; i++) {
+        const row = b2bData[i]!;
         const gstin   = String(row[0]).trim();
         const name    = String(row[1]).trim();
         const invNo   = String(row[2]).trim();
@@ -88,7 +90,7 @@ router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, r
         const igst    = Number(row[9]) || 0;
         const cgst    = Number(row[10]) || 0;
         const sgst    = Number(row[11]) || 0;
-        if (!gstin || !invNo) { skipped++; continue; }
+        if (!gstin || !invNo) { skipped++; errors.push(`B2B row ${i + 6}: missing gstin or invoice number`); continue; }
         records.push({
           period, supplierGstin: gstin, supplierName: name || gstin,
           invoiceNumber: invNo, invoiceDate: invDate || new Date().toISOString().split("T")[0]!,
@@ -99,8 +101,10 @@ router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, r
 
       if (workbook.SheetNames.includes("B2B-CDNR")) {
         const cdnrRaw = XLSX.utils.sheet_to_json(workbook.Sheets["B2B-CDNR"]!, { header: 1, defval: "" }) as unknown[][];
-        const cdnrData = cdnrRaw.slice(5).filter((r) => r[0] !== "" && r[2] !== "");
-        for (const row of cdnrData) {
+        // B2B-CDNR expects 13 columns: [0]=gstin [1]=name [2]=noteNo ... [5]=noteDate ... [9]=taxable [10]=igst [11]=cgst [12]=sgst
+        const cdnrData = cdnrRaw.slice(5).filter((r) => Array.isArray(r) && r.length >= 13 && r[0] !== "" && r[2] !== "");
+        for (let i = 0; i < cdnrData.length; i++) {
+          const row = cdnrData[i]!;
           const gstin   = String(row[0]).trim();
           const name    = String(row[1]).trim();
           const noteNo  = `CDN-${String(row[2]).trim()}`;
@@ -109,7 +113,7 @@ router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, r
           const igst    = Number(row[10]) || 0;
           const cgst    = Number(row[11]) || 0;
           const sgst    = Number(row[12]) || 0;
-          if (!gstin) { skipped++; continue; }
+          if (!gstin) { skipped++; errors.push(`B2B-CDNR row ${i + 6}: missing gstin`); continue; }
           records.push({
             period, supplierGstin: gstin, supplierName: name || gstin,
             invoiceNumber: noteNo, invoiceDate: noteDate || new Date().toISOString().split("T")[0]!,
@@ -147,7 +151,7 @@ router.post("/gstr2b/import", authenticate, upload.single("file"), async (req, r
     }
 
     if (records.length > 0) {
-      await createGstr2bRecords(records);
+      await upsertGstr2bRecords(records);
     }
 
     await logAudit(req, "gstr2b_imported", "gstr2b", undefined, `Period: ${period}, Imported: ${imported}`);

@@ -317,6 +317,28 @@ export async function createGstr2bRecords(records: Array<Omit<Gstr2bRecord, "_id
   return result.insertedCount;
 }
 
+/**
+ * Idempotent bulk import: upsert by (period, supplierGstin, invoiceNumber).
+ * Returns the number of records that were created or modified.
+ */
+export async function upsertGstr2bRecords(records: Array<Omit<Gstr2bRecord, "_id" | "createdAt" | "updatedAt">>): Promise<number> {
+  if (records.length === 0) return 0;
+  const db = getDb();
+  const now = new Date();
+  const ops = records.map((r) => ({
+    updateOne: {
+      filter: { period: r.period, supplierGstin: r.supplierGstin, invoiceNumber: r.invoiceNumber },
+      update: {
+        $set: { ...r, updatedAt: now },
+        $setOnInsert: { createdAt: now },
+      },
+      upsert: true,
+    },
+  }));
+  const result = await db.collection<Gstr2bRecord>(COLLECTIONS.GSTR2B_RECORDS).bulkWrite(ops, { ordered: false });
+  return (result.upsertedCount ?? 0) + (result.modifiedCount ?? 0);
+}
+
 export async function findGstr2bByPeriod(period: string): Promise<Array<Gstr2bRecord & { _id: ObjectId }>> {
   const db = getDb();
   return db.collection<Gstr2bRecord>(COLLECTIONS.GSTR2B_RECORDS).find({ period }).toArray();
@@ -341,6 +363,48 @@ export async function deleteReconciliationByPeriod(period: string): Promise<numb
 export async function findReconciliationByPeriod(period: string): Promise<Array<ReconciliationRecord & { _id: ObjectId }>> {
   const db = getDb();
   return db.collection<ReconciliationRecord>(COLLECTIONS.RECONCILIATION_RECORDS).find({ period }).toArray();
+}
+
+/**
+ * Aggregate reconciliation record counts by status for a given period.
+ * One DB round-trip instead of fetching every row and tallying in JS.
+ */
+export interface ReconciliationStatusCount {
+  status: string;
+  count: number;
+}
+export async function findReconciliationSummary(period?: string): Promise<ReconciliationStatusCount[]> {
+  const db = getDb();
+  const pipeline: Filter<ReconciliationRecord>[] = [];
+  if (period) pipeline.push({ period } as Filter<ReconciliationRecord>);
+  const cursor = db.collection<ReconciliationRecord>(COLLECTIONS.RECONCILIATION_RECORDS).aggregate([
+    ...(period ? [{ $match: { period } }] : []),
+    { $group: { _id: "$status", count: { $sum: 1 } } },
+  ]);
+  const rows = await cursor.toArray() as Array<{ _id: string; count: number }>;
+  return rows.map((r) => ({ status: r._id, count: r.count }));
+}
+
+/**
+ * Expand a period string ("MMYYYY") to a UTC date range and return the
+ * pushed invoices whose invoiceDate falls within it.
+ */
+export async function findPushedInvoicesForPeriod(
+  period: string,
+): Promise<Array<Invoice & { _id: ObjectId }>> {
+  const m = /^(\d{2})(\d{4})$/.exec(period);
+  if (!m) return [];
+  const month = Number(m[1]);
+  const year = Number(m[2]);
+  if (month < 1 || month > 12) return [];
+  const start = new Date(Date.UTC(year, month - 1, 1));
+  const end = new Date(Date.UTC(year, month, 0));
+  const startStr = start.toISOString().slice(0, 10);
+  const endStr = end.toISOString().slice(0, 10);
+  const db = getDb();
+  return db.collection<Invoice>(COLLECTIONS.INVOICES)
+    .find({ status: "pushed", invoiceDate: { $gte: startStr, $lte: endStr } })
+    .toArray();
 }
 
 export async function createReconciliationRecord(record: Omit<ReconciliationRecord, "_id" | "createdAt" | "updatedAt">): Promise<ReconciliationRecord & { _id: ObjectId }> {

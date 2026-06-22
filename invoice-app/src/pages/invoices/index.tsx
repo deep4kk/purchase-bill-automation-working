@@ -1,31 +1,44 @@
 import { useState } from "react";
 import { Link } from "wouter";
 import { format } from "date-fns";
-import { useListInvoices, ListInvoicesStatus } from "@workspace/api-client-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useListInvoices, ListInvoicesStatus, getListInvoicesQueryKey } from "@workspace/api-client-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Search, SlidersHorizontal, Eye, ChevronUp, ChevronDown, ChevronsUpDown } from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Search, SlidersHorizontal, Eye, ChevronUp, ChevronDown, ChevronsUpDown, CheckCircle, AlertCircle } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
+import { toast } from "sonner";
+
+type Tab = "all" | "pending-approval";
 
 export default function InvoicesList() {
+  const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState("");
-  const [status, setStatus] = useState<ListInvoicesStatus | "all">("all");
+  const [tab, setTab] = useState<Tab>("all");
+  const [statusFilter, setStatusFilter] = useState<ListInvoicesStatus | "all">("all");
   const [sortBy, setSortBy] = useState<string>("updatedAt");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
+  const [selectedInvoices, setSelectedInvoices] = useState<Set<string>>(new Set());
+  const [isApproving, setIsApproving] = useState(false);
   const limit = 20;
 
+  // Determine status based on tab
+  const effectiveStatus: ListInvoicesStatus | "all" = tab === "pending-approval" ? "extracted" : statusFilter;
+
   const { data, isLoading } = useListInvoices(
-    { page, limit, search: search || undefined, status: status === "all" ? undefined : status, sortBy, sortOrder },
+    { page, limit, search: search || undefined, status: effectiveStatus === "all" ? undefined : effectiveStatus, sortBy, sortOrder },
     {
       query: {
         refetchInterval: (query) => {
           const invoices = (query.state.data as { data?: Array<{ status: string }> } | undefined)?.data ?? [];
-          const hasActive = invoices.some((inv) => inv.status === "pending" || inv.status === "extracting");
+          const hasActive = invoices.some((inv) => inv.status === "pending" || inv.status === "extracting" || inv.status === "reviewing");
           return hasActive ? 3000 : false;
         },
       },
@@ -60,6 +73,63 @@ export default function InvoicesList() {
     }
   };
 
+  const toggleSelectInvoice = (invoiceId: string) => {
+    const newSelected = new Set(selectedInvoices);
+    if (newSelected.has(invoiceId)) {
+      newSelected.delete(invoiceId);
+    } else {
+      newSelected.add(invoiceId);
+    }
+    setSelectedInvoices(newSelected);
+  };
+
+  const toggleSelectAll = () => {
+    if (selectedInvoices.size === data?.data.length) {
+      setSelectedInvoices(new Set());
+    } else {
+      const allIds = new Set(data?.data.map((inv) => inv.id) || []);
+      setSelectedInvoices(allIds);
+    }
+  };
+
+  const handleBulkApprove = async () => {
+    if (selectedInvoices.size === 0) {
+      toast.error("Please select at least one invoice to approve");
+      return;
+    }
+
+    setIsApproving(true);
+    try {
+      const response = await fetch("/api/invoices/bulk/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ invoiceIds: Array.from(selectedInvoices) }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to approve invoices");
+      }
+
+      const result = await response.json();
+      
+      if (result.approved?.length > 0) {
+        toast.success(`Approved ${result.approved.length} invoice${result.approved.length > 1 ? "s" : ""}`);
+        setSelectedInvoices(new Set());
+        queryClient.invalidateQueries({ queryKey: getListInvoicesQueryKey({ page, limit }) });
+      }
+
+      if (result.failed?.length > 0) {
+        toast.error(`Failed to approve ${result.failed.length} invoice${result.failed.length > 1 ? "s" : ""}`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to approve invoices");
+    } finally {
+      setIsApproving(false);
+    }
+  };
+
+  const pendingApprovalCount = data?.data.filter((inv) => inv.status === "extracted").length || 0;
+
   return (
     <div className="p-8 space-y-6 bg-background min-h-full">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -69,145 +139,326 @@ export default function InvoicesList() {
         </div>
       </div>
 
-      <Card>
-        <CardHeader className="pb-4">
-          <div className="flex flex-col sm:flex-row gap-4 justify-between items-center">
-            <div className="relative w-full sm:w-96">
-              <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-              <Input
-                placeholder="Search invoices by number or supplier..."
-                className="pl-8"
-                value={search}
-                onChange={(e) => {
-                  setSearch(e.target.value);
-                  setPage(1);
-                }}
-              />
-            </div>
-            <div className="flex gap-2 w-full sm:w-auto">
-              <Select value={status} onValueChange={(val: any) => { setStatus(val); setPage(1); }}>
-                <SelectTrigger className="w-full sm:w-[180px]">
-                  <SlidersHorizontal className="mr-2 h-4 w-4" />
-                  <SelectValue placeholder="Filter by status" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All Statuses</SelectItem>
-                  <SelectItem value="pending">Pending</SelectItem>
-                  <SelectItem value="extracting">Extracting</SelectItem>
-                  <SelectItem value="extracted">Extracted</SelectItem>
-                  <SelectItem value="reviewing">Reviewing</SelectItem>
-                  <SelectItem value="approved">Approved</SelectItem>
-                  <SelectItem value="pushed">Pushed to ERP</SelectItem>
-                  <SelectItem value="failed">Failed</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div className="border rounded-md overflow-hidden">
-            <Table>
-              <TableHeader>
-                <TableRow className="bg-muted/50">
-                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("invoiceNumber")}>
-                    <div className="flex items-center">Invoice # {getSortIcon("invoiceNumber")}</div>
-                  </TableHead>
-                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("invoiceDate")}>
-                    <div className="flex items-center">Date {getSortIcon("invoiceDate")}</div>
-                  </TableHead>
-                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("supplierName")}>
-                    <div className="flex items-center">Supplier {getSortIcon("supplierName")}</div>
-                  </TableHead>
-                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("grandTotal")}>
-                    <div className="flex items-center">Amount {getSortIcon("grandTotal")}</div>
-                  </TableHead>
-                  <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("status")}>
-                    <div className="flex items-center">Status {getSortIcon("status")}</div>
-                  </TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {isLoading ? (
-                  Array.from({ length: 5 }).map((_, i) => (
-                    <TableRow key={i}>
-                      <TableCell><Skeleton className="h-4 w-24" /></TableCell>
-                      <TableCell><Skeleton className="h-4 w-20" /></TableCell>
-                      <TableCell><Skeleton className="h-4 w-40" /></TableCell>
-                      <TableCell><Skeleton className="h-4 w-24" /></TableCell>
-                      <TableCell><Skeleton className="h-6 w-24 rounded-full" /></TableCell>
-                      <TableCell><Skeleton className="h-8 w-8 ml-auto rounded" /></TableCell>
+      <Tabs value={tab} onValueChange={(value) => { setTab(value as Tab); setPage(1); setSelectedInvoices(new Set()); }}>
+        <TabsList>
+          <TabsTrigger value="all">All Invoices</TabsTrigger>
+          <TabsTrigger value="pending-approval" className="flex items-center gap-2">
+            Pending Approval
+            {pendingApprovalCount > 0 && (
+              <Badge variant="secondary" className="ml-1 h-5 w-5 flex items-center justify-center p-0 text-xs">
+                {pendingApprovalCount}
+              </Badge>
+            )}
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="all" className="space-y-4">
+          <Card>
+            <CardHeader className="pb-4">
+              <div className="flex flex-col sm:flex-row gap-4 justify-between items-center">
+                <div className="relative w-full sm:w-96">
+                  <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                  <Input
+                    placeholder="Search invoices by number or supplier..."
+                    className="pl-8"
+                    value={search}
+                    onChange={(e) => {
+                      setSearch(e.target.value);
+                      setPage(1);
+                    }}
+                  />
+                </div>
+                <div className="flex gap-2 w-full sm:w-auto">
+                  <Select value={statusFilter} onValueChange={(val: any) => { setStatusFilter(val); setPage(1); }}>
+                    <SelectTrigger className="w-full sm:w-[180px]">
+                      <SlidersHorizontal className="mr-2 h-4 w-4" />
+                      <SelectValue placeholder="Filter by status" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All Statuses</SelectItem>
+                      <SelectItem value="pending">Pending</SelectItem>
+                      <SelectItem value="extracting">Extracting</SelectItem>
+                      <SelectItem value="extracted">Extracted</SelectItem>
+                      <SelectItem value="reviewing">Reviewing</SelectItem>
+                      <SelectItem value="approved">Approved</SelectItem>
+                      <SelectItem value="pushed">Pushed to ERP</SelectItem>
+                      <SelectItem value="failed">Failed</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="border rounded-md overflow-hidden">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="bg-muted/50">
+                      <TableHead className="w-12">
+                        <Checkbox
+                          checked={selectedInvoices.size > 0 && selectedInvoices.size === data?.data.length}
+                          indeterminate={selectedInvoices.size > 0 && selectedInvoices.size < (data?.data.length || 0) ? true : undefined}
+                          onCheckedChange={toggleSelectAll}
+                        />
+                      </TableHead>
+                      <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("invoiceNumber")}>
+                        <div className="flex items-center">Invoice # {getSortIcon("invoiceNumber")}</div>
+                      </TableHead>
+                      <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("invoiceDate")}>
+                        <div className="flex items-center">Date {getSortIcon("invoiceDate")}</div>
+                      </TableHead>
+                      <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("supplierName")}>
+                        <div className="flex items-center">Supplier {getSortIcon("supplierName")}</div>
+                      </TableHead>
+                      <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("grandTotal")}>
+                        <div className="flex items-center">Amount {getSortIcon("grandTotal")}</div>
+                      </TableHead>
+                      <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("status")}>
+                        <div className="flex items-center">Status {getSortIcon("status")}</div>
+                      </TableHead>
+                      <TableHead className="text-right">Actions</TableHead>
                     </TableRow>
-                  ))
-                ) : data?.data.length === 0 ? (
-                  <TableRow>
-                    <TableCell colSpan={6} className="h-32 text-center text-muted-foreground">
-                      No invoices found.
-                    </TableCell>
-                  </TableRow>
-                ) : (
-                  data?.data.map((invoice) => (
-                    <TableRow key={invoice.id} className="hover:bg-muted/30">
-                      <TableCell className="font-medium text-foreground">
-                        {invoice.invoiceNumber || <span className="text-muted-foreground italic">Pending</span>}
-                        <div className="text-xs text-muted-foreground mt-0.5 truncate max-w-[150px]">{invoice.fileName}</div>
-                      </TableCell>
-                      <TableCell>
-                        {invoice.invoiceDate ? format(new Date(invoice.invoiceDate), 'MMM dd, yyyy') : '-'}
-                      </TableCell>
-                      <TableCell>
-                        <div className="font-medium text-foreground">{invoice.supplierName || '-'}</div>
-                        <div className="text-xs text-muted-foreground mt-0.5">{invoice.supplierGstin || ''}</div>
-                      </TableCell>
-                      <TableCell className="font-medium">
-                        ₹{invoice.grandTotal?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) || "0.00"}
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="outline" className={`font-normal ${getStatusColor(invoice.status)}`}>
-                          {invoice.status.replace("_", " ")}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <Link href={`/invoices/${invoice.id}`}>
-                          <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-primary/10 hover:text-primary">
-                            <Eye className="h-4 w-4" />
-                          </Button>
-                        </Link>
-                      </TableCell>
-                    </TableRow>
-                  ))
+                  </TableHeader>
+                  <TableBody>
+                    {isLoading ? (
+                      Array.from({ length: 5 }).map((_, i) => (
+                        <TableRow key={i}>
+                          <TableCell><Skeleton className="h-4 w-4" /></TableCell>
+                          <TableCell><Skeleton className="h-4 w-24" /></TableCell>
+                          <TableCell><Skeleton className="h-4 w-20" /></TableCell>
+                          <TableCell><Skeleton className="h-4 w-40" /></TableCell>
+                          <TableCell><Skeleton className="h-4 w-24" /></TableCell>
+                          <TableCell><Skeleton className="h-6 w-24 rounded-full" /></TableCell>
+                          <TableCell><Skeleton className="h-8 w-8 ml-auto rounded" /></TableCell>
+                        </TableRow>
+                      ))
+                    ) : data?.data.length === 0 ? (
+                      <TableRow>
+                        <TableCell colSpan={7} className="h-32 text-center text-muted-foreground">
+                          No invoices found.
+                        </TableCell>
+                      </TableRow>
+                    ) : (
+                      data?.data.map((invoice) => (
+                        <TableRow key={invoice.id} className={`hover:bg-muted/30 ${selectedInvoices.has(invoice.id) ? "bg-blue-50" : ""}`}>
+                          <TableCell>
+                            <Checkbox
+                              checked={selectedInvoices.has(invoice.id)}
+                              onCheckedChange={() => toggleSelectInvoice(invoice.id)}
+                            />
+                          </TableCell>
+                          <TableCell className="font-medium text-foreground">
+                            {invoice.invoiceNumber || <span className="text-muted-foreground italic">Pending</span>}
+                            <div className="text-xs text-muted-foreground mt-0.5 truncate max-w-[150px]">{invoice.fileName}</div>
+                          </TableCell>
+                          <TableCell>
+                            {invoice.invoiceDate ? format(new Date(invoice.invoiceDate), "MMM dd, yyyy") : "-"}
+                          </TableCell>
+                          <TableCell>
+                            <div className="font-medium text-foreground">{invoice.supplierName || "-"}</div>
+                            <div className="text-xs text-muted-foreground mt-0.5">{invoice.supplierGstin || ""}</div>
+                          </TableCell>
+                          <TableCell className="font-medium">
+                            ₹{invoice.grandTotal?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) || "0.00"}
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant="outline" className={`font-normal ${getStatusColor(invoice.status)}`}>
+                              {invoice.status.replace("_", " ")}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <Link href={`/invoices/${invoice.id}`}>
+                              <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-primary/10 hover:text-primary">
+                                <Eye className="h-4 w-4" />
+                              </Button>
+                            </Link>
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    )}
+                  </TableBody>
+                </Table>
+              </div>
+
+              {data && data.total > limit && (
+                <div className="flex items-center justify-between mt-4">
+                  <div className="text-sm text-muted-foreground">
+                    Showing {((page - 1) * limit) + 1} to {Math.min(page * limit, data.total)} of {data.total}
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={page === 1}
+                      onClick={() => setPage((p) => p - 1)}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={page * limit >= data.total}
+                      onClick={() => setPage((p) => p + 1)}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="pending-approval" className="space-y-4">
+          <Card>
+            <CardHeader className="pb-4">
+              <div className="flex flex-col sm:flex-row gap-4 justify-between items-center">
+                <div className="relative w-full sm:w-96">
+                  <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                  <Input
+                    placeholder="Search invoices by number or supplier..."
+                    className="pl-8"
+                    value={search}
+                    onChange={(e) => {
+                      setSearch(e.target.value);
+                      setPage(1);
+                    }}
+                  />
+                </div>
+                {selectedInvoices.size > 0 && (
+                  <Button
+                    onClick={handleBulkApprove}
+                    disabled={isApproving}
+                    className="bg-green-600 hover:bg-green-700 text-white w-full sm:w-auto"
+                  >
+                    <CheckCircle className="mr-2 h-4 w-4" />
+                    Approve Selected ({selectedInvoices.size})
+                  </Button>
                 )}
-              </TableBody>
-            </Table>
-          </div>
-          
-          {data && data.total > limit && (
-            <div className="flex items-center justify-between mt-4">
-              <div className="text-sm text-muted-foreground">
-                Showing {((page - 1) * limit) + 1} to {Math.min(page * limit, data.total)} of {data.total}
               </div>
-              <div className="flex gap-2">
-                <Button 
-                  variant="outline" 
-                  size="sm" 
-                  disabled={page === 1}
-                  onClick={() => setPage(p => p - 1)}
-                >
-                  Previous
-                </Button>
-                <Button 
-                  variant="outline" 
-                  size="sm" 
-                  disabled={page * limit >= data.total}
-                  onClick={() => setPage(p => p + 1)}
-                >
-                  Next
-                </Button>
+            </CardHeader>
+            <CardContent>
+              <div className="border rounded-md overflow-hidden">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="bg-muted/50">
+                      <TableHead className="w-12">
+                        <Checkbox
+                          checked={selectedInvoices.size > 0 && selectedInvoices.size === data?.data.length}
+                          indeterminate={selectedInvoices.size > 0 && selectedInvoices.size < (data?.data.length || 0)}
+                          onCheckedChange={toggleSelectAll}
+                        />
+                      </TableHead>
+                      <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("invoiceNumber")}>
+                        <div className="flex items-center">Invoice # {getSortIcon("invoiceNumber")}</div>
+                      </TableHead>
+                      <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("invoiceDate")}>
+                        <div className="flex items-center">Date {getSortIcon("invoiceDate")}</div>
+                      </TableHead>
+                      <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("supplierName")}>
+                        <div className="flex items-center">Supplier {getSortIcon("supplierName")}</div>
+                      </TableHead>
+                      <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("grandTotal")}>
+                        <div className="flex items-center">Amount {getSortIcon("grandTotal")}</div>
+                      </TableHead>
+                      <TableHead className="cursor-pointer hover:bg-muted/70" onClick={() => handleSort("status")}>
+                        <div className="flex items-center">Status {getSortIcon("status")}</div>
+                      </TableHead>
+                      <TableHead className="text-right">Actions</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {isLoading ? (
+                      Array.from({ length: 5 }).map((_, i) => (
+                        <TableRow key={i}>
+                          <TableCell><Skeleton className="h-4 w-4" /></TableCell>
+                          <TableCell><Skeleton className="h-4 w-24" /></TableCell>
+                          <TableCell><Skeleton className="h-4 w-20" /></TableCell>
+                          <TableCell><Skeleton className="h-4 w-40" /></TableCell>
+                          <TableCell><Skeleton className="h-4 w-24" /></TableCell>
+                          <TableCell><Skeleton className="h-6 w-24 rounded-full" /></TableCell>
+                          <TableCell><Skeleton className="h-8 w-8 ml-auto rounded" /></TableCell>
+                        </TableRow>
+                      ))
+                    ) : data?.data.length === 0 ? (
+                      <TableRow>
+                        <TableCell colSpan={7} className="h-32 text-center text-muted-foreground">
+                          <div className="flex flex-col items-center gap-2">
+                            <AlertCircle className="h-6 w-6 text-muted-foreground/50" />
+                            <p>No invoices pending approval</p>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ) : (
+                      data?.data.map((invoice) => (
+                        <TableRow key={invoice.id} className={`hover:bg-muted/30 ${selectedInvoices.has(invoice.id) ? "bg-blue-50" : ""}`}>
+                          <TableCell>
+                            <Checkbox
+                              checked={selectedInvoices.has(invoice.id)}
+                              onCheckedChange={() => toggleSelectInvoice(invoice.id)}
+                            />
+                          </TableCell>
+                          <TableCell className="font-medium text-foreground">
+                            {invoice.invoiceNumber || <span className="text-muted-foreground italic">Pending</span>}
+                            <div className="text-xs text-muted-foreground mt-0.5 truncate max-w-[150px]">{invoice.fileName}</div>
+                          </TableCell>
+                          <TableCell>
+                            {invoice.invoiceDate ? format(new Date(invoice.invoiceDate), "MMM dd, yyyy") : "-"}
+                          </TableCell>
+                          <TableCell>
+                            <div className="font-medium text-foreground">{invoice.supplierName || "-"}</div>
+                            <div className="text-xs text-muted-foreground mt-0.5">{invoice.supplierGstin || ""}</div>
+                          </TableCell>
+                          <TableCell className="font-medium">
+                            ₹{invoice.grandTotal?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) || "0.00"}
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant="outline" className={`font-normal ${getStatusColor(invoice.status)}`}>
+                              {invoice.status.replace("_", " ")}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <Link href={`/invoices/${invoice.id}`}>
+                              <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-primary/10 hover:text-primary">
+                                <Eye className="h-4 w-4" />
+                              </Button>
+                            </Link>
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    )}
+                  </TableBody>
+                </Table>
               </div>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+
+              {data && data.total > limit && (
+                <div className="flex items-center justify-between mt-4">
+                  <div className="text-sm text-muted-foreground">
+                    Showing {((page - 1) * limit) + 1} to {Math.min(page * limit, data.total)} of {data.total}
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={page === 1}
+                      onClick={() => setPage((p) => p - 1)}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={page * limit >= data.total}
+                      onClick={() => setPage((p) => p + 1)}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }

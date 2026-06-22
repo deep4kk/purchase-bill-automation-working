@@ -2,6 +2,7 @@ import { Router } from "express";
 import { authenticate } from "../lib/auth";
 import { ListAuditLogsQueryParams } from "@workspace/api-zod";
 import { findAuditLogs } from "../lib/dal";
+import { buildDateRangeFilter } from "../lib/filters";
 
 const router = Router();
 
@@ -17,8 +18,16 @@ router.get("/audit-logs", authenticate, async (req, res): Promise<void> => {
     if (params.data.action) filter.action = params.data.action;
     if (params.data.userId) filter.userId = params.data.userId;
     if (params.data.resourceType) filter.resourceType = params.data.resourceType;
-    if (params.data.dateFrom) filter.createdAt = { $gte: new Date(params.data.dateFrom) };
-    if (params.data.dateTo) filter.createdAt = { ...(filter.createdAt as object || {}), $lte: new Date(params.data.dateTo) };
+    if (params.data.dateFrom || params.data.dateTo) {
+      Object.assign(
+        filter,
+        buildDateRangeFilter(
+          "createdAt",
+          params.data.dateFrom ? new Date(params.data.dateFrom).toISOString() : undefined,
+          params.data.dateTo ? new Date(params.data.dateTo).toISOString() : undefined,
+        ),
+      );
+    }
   }
 
   const result = await findAuditLogs(filter, { page, limit, sortBy, sortOrder });

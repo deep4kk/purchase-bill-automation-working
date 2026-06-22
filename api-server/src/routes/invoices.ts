@@ -4,8 +4,10 @@ import path from "path";
 import fs from "fs";
 import { authenticate, requireRole } from "../lib/auth";
 import { logAudit } from "../lib/audit";
+import { logger } from "../lib/logger";
 import { extractInvoiceWithAI, matchSupplierWithAI } from "../lib/ai";
-import { ensureUploadDir, UPLOAD_DIR, getFileUrl } from "../lib/storage";
+import { ensureUploadDir, UPLOAD_DIR } from "../lib/storage";
+import { getStorageProvider } from "../lib/storage-adapter";
 import {
   ListInvoicesQueryParams,
   GetInvoiceParams,
@@ -21,14 +23,16 @@ import {
 import {
   findInvoices,
   findInvoiceById,
+  findSupplierById,
   createInvoice,
   updateInvoice,
   deleteInvoice,
-  findSuppliers,
   getErpConnection,
   toStringId,
 } from "../lib/dal";
 import { Invoice, InvoiceItem } from "../lib/schemas";
+import { buildDateRangeFilter } from "../lib/filters";
+import { getCachedSuppliers, invalidateSupplierCache } from "../lib/cache";
 
 ensureUploadDir();
 
@@ -75,6 +79,7 @@ function formatInvoice(inv: Invoice & { _id: { toHexString: () => string }; crea
     erpDocumentId: inv.erpDocumentId ?? null,
     erpStatus: inv.erpStatus ?? null,
     erpError: inv.erpError ?? null,
+    extractionError: inv.extractionError ?? null,
     extractedAt: inv.extractedAt?.toISOString() ?? null,
     createdAt: inv.createdAt.toISOString(),
     updatedAt: inv.updatedAt.toISOString(),
@@ -93,8 +98,9 @@ router.get("/invoices", authenticate, async (req, res): Promise<void> => {
     if (params.data.status) filter.status = params.data.status;
     if (params.data.search) filter.supplierName = { $regex: params.data.search, $options: "i" };
     if (params.data.supplierId) filter.matchedSupplierId = params.data.supplierId;
-    if (params.data.dateFrom) filter.invoiceDate = { $gte: params.data.dateFrom };
-    if (params.data.dateTo) filter.invoiceDate = { ...(filter.invoiceDate as object || {}), $lte: params.data.dateTo };
+    if (params.data.dateFrom || params.data.dateTo) {
+      Object.assign(filter, buildDateRangeFilter("invoiceDate", params.data.dateFrom, params.data.dateTo));
+    }
   }
 
   const result = await findInvoices(filter, { page, limit, sortBy, sortOrder });
@@ -103,10 +109,10 @@ router.get("/invoices", authenticate, async (req, res): Promise<void> => {
 
 async function runExtraction(invId: string, filePath: string, fileType: string) {
   try {
+    logger.info({ invoiceId: invId, filePath, fileType }, "Background extraction started");
     await updateInvoice(invId, { status: "extracting" });
     const extracted = await extractInvoiceWithAI(filePath, fileType);
-    const suppliersResult = await findSuppliers({}, { limit: 1000 });
-    const suppliers = suppliersResult.data.map(s => ({ id: s._id.toHexString(), name: s.name, gstin: s.gstin }));
+    const suppliers = await getCachedSuppliers();
     const matchResult = await matchSupplierWithAI(extracted.supplierName, extracted.supplierGstin, suppliers);
     let matchedSupplierName: string | null = null;
     if (matchResult.matchedId) {
@@ -132,8 +138,10 @@ async function runExtraction(invId: string, filePath: string, fileType: string) 
       supplierMatchStatus: matchResult.matchedId ? "matched" : "unmatched",
       extractedAt: new Date(),
     });
-  } catch {
-    await updateInvoice(invId, { status: "failed" });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown extraction error";
+    logger.error({ err, invoiceId: invId }, "Background extraction failed");
+    await updateInvoice(invId, { status: "failed", extractionError: message });
   }
 }
 
@@ -143,22 +151,52 @@ router.post("/invoices/upload", authenticate, upload.array("files", 20), async (
     res.status(400).json({ error: "No files uploaded" });
     return;
   }
+
+  const storageProvider = getStorageProvider();
   const inserted = [];
+
   for (const file of files) {
-    const ext = path.extname(file.originalname).slice(1).toLowerCase();
-    const inv = await createInvoice({
-      fileName: file.originalname,
-      fileUrl: getFileUrl(file.filename),
-      fileType: ext,
-      status: "pending",
-      uploadedBy: req.user!.userId,
-      items: [],
-    });
-    await logAudit(req, "invoice_uploaded", "invoice", inv._id.toHexString(), file.originalname);
-    inserted.push(formatInvoice(inv));
-    const filePath = path.join(UPLOAD_DIR, file.filename);
-    setImmediate(() => runExtraction(inv._id.toHexString(), filePath, ext));
+    try {
+      const ext = path.extname(file.originalname).slice(1).toLowerCase();
+      const localFilePath = path.join(UPLOAD_DIR, file.filename);
+
+      // Upload to configured storage (disk or Cloudinary)
+      const uploadResult = await storageProvider.uploadFile(localFilePath, file.filename);
+
+      const inv = await createInvoice({
+        fileName: file.originalname,
+        fileUrl: uploadResult.url,
+        fileType: ext,
+        status: "pending",
+        uploadedBy: req.user!.userId,
+        items: [],
+      });
+      await logAudit(req, "invoice_uploaded", "invoice", inv._id.toHexString(), file.originalname);
+      inserted.push(formatInvoice(inv));
+
+      logger.info({ invoiceId: inv._id.toHexString(), fileName: file.originalname }, "Invoice uploaded, scheduling background extraction");
+
+      setImmediate(async () => {
+        try {
+          await runExtraction(inv._id.toHexString(), localFilePath, ext);
+          // Clean up local file AFTER extraction completes (if using Cloudinary)
+          if (process.env.STORAGE_TYPE === "cloudinary" && fs.existsSync(localFilePath)) {
+            fs.unlinkSync(localFilePath);
+            logger.info({ fileName: file.originalname }, "Local file deleted after extraction");
+          }
+        } catch (err) {
+          logger.error({ err, invoiceId: inv._id.toHexString() }, "Background extraction task failed");
+          // Still clean up file if extraction failed
+          if (process.env.STORAGE_TYPE === "cloudinary" && fs.existsSync(localFilePath)) {
+            fs.unlinkSync(localFilePath);
+          }
+        }
+      });
+    } catch (err) {
+      logger.error({ err, fileName: file.originalname }, "File upload failed");
+    }
   }
+
   res.status(201).json(inserted);
 });
 
@@ -239,8 +277,7 @@ router.post("/invoices/:invoiceId/extract", authenticate, async (req, res): Prom
     const filePath = path.join(UPLOAD_DIR, path.basename(inv.fileUrl));
     const extracted = await extractInvoiceWithAI(filePath, inv.fileType);
 
-    const suppliersResult = await findSuppliers({}, { limit: 1000 });
-    const suppliers = suppliersResult.data.map(s => ({ id: s._id.toHexString(), name: s.name, gstin: s.gstin }));
+    const suppliers = await getCachedSuppliers();
     const matchResult = await matchSupplierWithAI(extracted.supplierName, extracted.supplierGstin, suppliers);
 
     let matchedSupplierName: string | null = null;
@@ -272,9 +309,10 @@ router.post("/invoices/:invoiceId/extract", authenticate, async (req, res): Prom
     await logAudit(req, "invoice_extracted", "invoice", invoiceId, `Confidence: ${extracted.confidenceScore}`);
     res.json(formatInvoice(updated!));
   } catch (err) {
-    await updateInvoice(invoiceId, { status: "failed" });
+    const message = err instanceof Error ? err.message : "Unknown error";
+    await updateInvoice(invoiceId, { status: "failed", extractionError: message });
     req.log.error({ err }, "Invoice extraction failed");
-    res.status(500).json({ error: "Extraction failed" });
+    res.status(500).json({ error: "Extraction failed", detail: message });
   }
 });
 
@@ -286,14 +324,19 @@ router.post("/invoices/:invoiceId/match-supplier", authenticate, async (req, res
   const supplierId = parsed.data.supplierId ?? null;
   let matchedSupplierName: string | null = null;
   if (supplierId) {
-    const supplier = await findSuppliers({ _id: { $oid: supplierId } }, { limit: 1 });
-    matchedSupplierName = supplier.data[0]?.name ?? null;
+    const supplier = await findSupplierById(supplierId);
+    if (!supplier) {
+      res.status(404).json({ error: "Supplier not found" });
+      return;
+    }
+    matchedSupplierName = supplier.name;
   }
 
   const inv = await updateInvoice(invoiceId, {
     matchedSupplierId: supplierId ?? undefined,
     matchedSupplierName,
     supplierMatchStatus: supplierId ? "manual" : "unmatched",
+    extractionError: undefined,
   });
 
   if (!inv) { res.status(404).json({ error: "Invoice not found" }); return; }
@@ -306,6 +349,34 @@ router.post("/invoices/:invoiceId/approve", authenticate, requireRole("admin", "
   if (!inv) { res.status(404).json({ error: "Invoice not found" }); return; }
   await logAudit(req, "invoice_approved", "invoice", invoiceId);
   res.json(formatInvoice(inv));
+});
+
+router.post("/invoices/bulk/approve", authenticate, requireRole("admin", "accounts", "purchase_manager"), async (req, res): Promise<void> => {
+  const { invoiceIds } = req.body as { invoiceIds: string[] };
+  
+  if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
+    res.status(400).json({ error: "invoiceIds array is required and must not be empty" });
+    return;
+  }
+
+  const results = { approved: [] as string[], failed: [] as { id: string; error: string }[] };
+
+  for (const invoiceId of invoiceIds) {
+    try {
+      const inv = await updateInvoice(invoiceId, { status: "approved" });
+      if (inv) {
+        await logAudit(req, "invoice_approved", "invoice", invoiceId);
+        results.approved.push(invoiceId);
+      } else {
+        results.failed.push({ id: invoiceId, error: "Invoice not found" });
+      }
+    } catch (err) {
+      logger.error({ err, invoiceId }, "Bulk approve failed for invoice");
+      results.failed.push({ id: invoiceId, error: err instanceof Error ? err.message : "Unknown error" });
+    }
+  }
+
+  res.json(results);
 });
 
 router.post("/invoices/:invoiceId/push-to-erp", authenticate, requireRole("admin", "accounts", "purchase_manager"), async (req, res): Promise<void> => {

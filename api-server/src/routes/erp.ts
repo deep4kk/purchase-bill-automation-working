@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { authenticate, requireRole } from "../lib/auth";
 import { UpdateErpSettingsBody } from "@workspace/api-zod";
+import { invalidateSupplierCache } from "../lib/cache";
 import {
   getErpConnection as dalGetErpConnection,
   createOrUpdateErpConnection,
@@ -91,6 +92,7 @@ router.post("/erp/sync/suppliers", authenticate, requireRole("admin", "accounts"
       });
       synced++;
     }
+    invalidateSupplierCache();
     await updateErpConnection({ lastSyncedAt: new Date() });
     res.json({ success: true, synced, message: `Synced ${synced} suppliers` });
   } catch (err: unknown) {

@@ -5,12 +5,12 @@ import { ListReconciliationRecordsQueryParams, RunReconciliationBody } from "@wo
 import {
   findReconciliationRecords,
   deleteReconciliationByPeriod,
-  findReconciliationByPeriod,
   createReconciliationRecords,
   findGstr2bByPeriod,
-  findInvoices,
+  findPushedInvoicesForPeriod,
+  findReconciliationSummary,
 } from "../lib/dal";
-import { ReconciliationRecord, Invoice, Gstr2bRecord } from "../lib/schemas";
+import { ReconciliationRecord, Invoice } from "../lib/schemas";
 
 const router = Router();
 
@@ -62,8 +62,7 @@ router.post("/reconciliation/run", authenticate, async (req, res): Promise<void>
   await deleteReconciliationByPeriod(period);
 
   const gstr2bRows = await findGstr2bByPeriod(period);
-  const erpInvoicesResult = await findInvoices({ status: "pushed" }, { limit: 10000 });
-  const erpInvoices = erpInvoicesResult.data;
+  const erpInvoices = await findPushedInvoicesForPeriod(period);
 
   const erpMap = new Map<string, Invoice>();
   for (const inv of erpInvoices) {
@@ -179,21 +178,19 @@ router.post("/reconciliation/run", authenticate, async (req, res): Promise<void>
 
 router.get("/reconciliation/summary", authenticate, async (req, res): Promise<void> => {
   const period = req.query.period as string | undefined;
-  const filter: Record<string, unknown> = {};
-  if (period) filter.period = period;
-
-  const rows = await findReconciliationByPeriod(period ?? "");
-  const total = rows.length;
-  const matched = rows.filter((r) => r.status === "matched").length;
+  const counts = await findReconciliationSummary(period);
+  const byStatus = new Map(counts.map((c) => [c.status, c.count]));
+  const total = counts.reduce((s, c) => s + c.count, 0);
+  const matched = byStatus.get("matched") ?? 0;
   res.json({
     period: period ?? "all",
     total,
     matched,
-    missingInErp: rows.filter((r) => r.status === "missing_in_erp").length,
-    missingInGstr2b: rows.filter((r) => r.status === "missing_in_gstr2b").length,
-    amountMismatch: rows.filter((r) => r.status === "amount_mismatch").length,
-    gstMismatch: rows.filter((r) => r.status === "gst_mismatch").length,
-    duplicate: rows.filter((r) => r.status === "duplicate").length,
+    missingInErp: byStatus.get("missing_in_erp") ?? 0,
+    missingInGstr2b: byStatus.get("missing_in_gstr2b") ?? 0,
+    amountMismatch: byStatus.get("amount_mismatch") ?? 0,
+    gstMismatch: byStatus.get("gst_mismatch") ?? 0,
+    duplicate: byStatus.get("duplicate") ?? 0,
     matchPercentage: total > 0 ? Math.round((matched / total) * 10000) / 100 : 0,
   });
 });

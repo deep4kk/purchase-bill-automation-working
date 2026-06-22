@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { authenticate } from "../lib/auth";
 import { logAudit } from "../lib/audit";
+import { invalidateSupplierCache } from "../lib/cache";
 import {
   ListSuppliersQueryParams,
   CreateSupplierBody,
@@ -59,6 +60,7 @@ router.post("/suppliers", authenticate, async (req, res): Promise<void> => {
     return;
   }
   const supplier = await createSupplier({ ...parsed.data, isMatched: parsed.data.isMatched ?? false });
+  invalidateSupplierCache();
   await logAudit(req, "supplier_created", "supplier", supplier._id.toHexString());
   res.status(201).json(formatSupplier(supplier));
 });
@@ -85,6 +87,7 @@ router.put("/suppliers/:supplierId", authenticate, async (req, res): Promise<voi
     res.status(404).json({ error: "Supplier not found" });
     return;
   }
+  invalidateSupplierCache();
   await logAudit(req, "supplier_updated", "supplier", supplierId);
   res.json(formatSupplier(supplier));
 });
@@ -96,6 +99,7 @@ router.delete("/suppliers/:supplierId", authenticate, async (req, res): Promise<
     res.status(404).json({ error: "Supplier not found" });
     return;
   }
+  invalidateSupplierCache();
   await logAudit(req, "supplier_deleted", "supplier", supplierId);
   res.json({ message: "Supplier deleted" });
 });

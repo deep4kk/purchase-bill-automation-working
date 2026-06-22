@@ -1,5 +1,6 @@
 import { MongoClient, Db } from "mongodb";
 import { COLLECTIONS } from "./schemas";
+import { logger } from "./logger";
 
 const MONGODB_URI = process.env.MONGODB_URI ?? "mongodb://localhost:27017";
 const DB_NAME = process.env.MONGODB_DB ?? "purchase_bill_automation";
@@ -84,6 +85,21 @@ export async function createIndexes(): Promise<void> {
     { key: { supplierName: "text" } },
     { key: { supplierGstin: 1, invoiceNumber: 1 } },
   ]);
+
+  // Idempotency: same supplier+invoice+period should only exist once.
+  // If the collection already has duplicates, skip with a warning rather
+  // than crash startup. New uploads use upserts, so duplicates stop appearing.
+  try {
+    await db.collection(COLLECTIONS.GSTR2B_RECORDS).createIndex(
+      { period: 1, supplierGstin: 1, invoiceNumber: 1 },
+      { unique: true, name: "uniq_period_gstin_invoiceno" },
+    );
+  } catch (err) {
+    logger.warn(
+      { err },
+      "Could not create unique index on gstr2b_records — collection may contain duplicates. New imports will still upsert by the same key.",
+    );
+  }
 
   // Reconciliation records indexes
   await db.collection(COLLECTIONS.RECONCILIATION_RECORDS).createIndexes([
